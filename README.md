@@ -562,6 +562,10 @@ The bundled client accepts them so Android profiles do not fail with Go flag exi
 
 `-gen-wrap-key` prints a fresh 64-hex key for the Android SSH control script. The public core currently accepts `-wrap/-wrap-key` as compatibility flags and logs that packet wrapping is not implemented in this build; use a WRAP-capable core if you need actual packet wrapping.
 
+## VK captcha notes
+
+The client supports VK `captchaNotRobot` redirect/session-token payloads and legacy image payloads. Slider/check API requests reuse the same browser XHR headers (`Origin`, `Referer`, `Sec-Fetch-*`, client hints) as the checkbox flow; missing these headers can make VK return `status=ERROR` on `captchaNotRobot.check` or `captchaNotRobot.getContent` and force manual fallback.
+
 ## Direct mode
 
 С флагом `-no-dtls` можно отправлять пакеты без обфускации DTLS и подключаться к обычным серверам Wireguard. Может привести к бану от вк/яндекса.

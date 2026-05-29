@@ -8,7 +8,10 @@ import (
 	"image/color"
 	"image/jpeg"
 	"reflect"
+	"strings"
 	"testing"
+
+	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 func TestParseSliderSteps(t *testing.T) {
@@ -89,6 +92,38 @@ const difficulty = 3;
 	}
 	if bootstrap.Settings.SettingsByType["slider"] != "slider-token" {
 		t.Fatalf("expected slider token, got %q", bootstrap.Settings.SettingsByType["slider"])
+	}
+}
+
+func TestApplyCaptchaAPIHeadersMatchesBrowserXHR(t *testing.T) {
+	t.Parallel()
+
+	profile := Profile{
+		UserAgent:       "Mozilla/5.0 test",
+		SecChUa:         `"Chromium";v="146"`,
+		SecChUaMobile:   "?0",
+		SecChUaPlatform: `"Windows"`,
+	}
+	req, err := fhttp.NewRequest("POST", "https://api.vk.ru/method/captchaNotRobot.getContent?v=5.131", strings.NewReader("session_token=s"))
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+
+	applyCaptchaAPIHeaders(req, profile)
+
+	assertHeader(t, req, "Content-Type", "application/x-www-form-urlencoded")
+	assertHeader(t, req, "Origin", "https://id.vk.ru")
+	assertHeader(t, req, "Referer", "https://id.vk.ru/")
+	assertHeader(t, req, "Sec-Fetch-Site", "same-site")
+	assertHeader(t, req, "Sec-Fetch-Mode", "cors")
+	assertHeader(t, req, "Sec-Fetch-Dest", "empty")
+	assertHeader(t, req, "User-Agent", profile.UserAgent)
+}
+
+func assertHeader(t *testing.T, req *fhttp.Request, key string, want string) {
+	t.Helper()
+	if got := req.Header.Get(key); got != want {
+		t.Fatalf("%s header = %q, want %q", key, got, want)
 	}
 }
 

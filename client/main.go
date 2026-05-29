@@ -481,16 +481,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 		}
 
 		req.Host = domain
-		applyBrowserProfileFhttp(req, profile)
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Origin", "https://id.vk.ru")
-		req.Header.Set("Referer", "https://id.vk.ru/")
-		req.Header.Set("Sec-Fetch-Site", "same-site")
-		req.Header.Set("Sec-Fetch-Mode", "cors")
-		req.Header.Set("Sec-Fetch-Dest", "empty")
-		req.Header.Set("Sec-GPC", "1")
-		req.Header.Set("Priority", "u=1, i")
+		applyCaptchaAPIHeaders(req, profile)
 
 		httpResp, err := client.Do(req)
 		if err != nil {
