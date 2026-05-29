@@ -59,3 +59,78 @@ func TestCaptchaSolveModeForAttempt(t *testing.T) {
 		}
 	})
 }
+
+func TestParseVkCaptchaErrorAllowsRedirectOnlyCaptcha(t *testing.T) {
+	t.Parallel()
+
+	captchaErr := ParseVkCaptchaError(map[string]interface{}{
+		"error_code":   float64(14),
+		"error_msg":    "Captcha needed",
+		"captcha_sid":  "12345",
+		"redirect_uri": "https://id.vk.ru/captcha?session_token=session-1",
+	})
+
+	if captchaErr == nil {
+		t.Fatal("expected redirect/session_token captcha payload to parse")
+	}
+	if !captchaErr.IsCaptchaError() {
+		t.Fatal("expected redirect/session_token captcha payload to be auto-solvable captcha")
+	}
+	if captchaErr.CaptchaImg != "" {
+		t.Fatalf("expected empty captcha image for redirect-only captcha, got %q", captchaErr.CaptchaImg)
+	}
+}
+
+func TestParseVkCaptchaErrorAllowsImageOnlyCaptcha(t *testing.T) {
+	t.Parallel()
+
+	captchaErr := ParseVkCaptchaError(map[string]interface{}{
+		"error_code":  float64(14),
+		"error_msg":   "Captcha needed",
+		"captcha_sid": "67890",
+		"captcha_img": "https://api.vk.ru/captcha.php?sid=67890",
+	})
+
+	if captchaErr == nil {
+		t.Fatal("expected legacy image captcha payload to parse")
+	}
+	if !captchaErr.IsCaptchaError() {
+		t.Fatal("expected image captcha payload to be handled as captcha")
+	}
+	if captchaErr.RedirectURI != "" || captchaErr.SessionToken != "" {
+		t.Fatalf("expected no redirect/session token, got redirect=%q session=%q", captchaErr.RedirectURI, captchaErr.SessionToken)
+	}
+}
+
+func TestParseVkCaptchaErrorAllowsRedirectCaptchaWithoutSid(t *testing.T) {
+	t.Parallel()
+
+	captchaErr := ParseVkCaptchaError(map[string]interface{}{
+		"error_code":   float64(14),
+		"error_msg":    "Captcha needed",
+		"redirect_uri": "https://id.vk.ru/captcha?session_token=session-2",
+	})
+
+	if captchaErr == nil {
+		t.Fatal("expected redirect/session_token captcha without sid to parse")
+	}
+	if !captchaErr.IsCaptchaError() {
+		t.Fatal("expected redirect/session_token captcha without sid to be auto-solvable captcha")
+	}
+}
+
+func TestParseVkCaptchaErrorAllowsMissingMessage(t *testing.T) {
+	t.Parallel()
+
+	captchaErr := ParseVkCaptchaError(map[string]interface{}{
+		"error_code":   float64(14),
+		"redirect_uri": "https://id.vk.ru/captcha?session_token=session-3",
+	})
+
+	if captchaErr == nil {
+		t.Fatal("expected captcha payload without error_msg to parse")
+	}
+	if captchaErr.ErrorMsg != "" {
+		t.Fatalf("expected empty error message, got %q", captchaErr.ErrorMsg)
+	}
+}

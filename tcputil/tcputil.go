@@ -47,11 +47,9 @@ func (d *DtlsPacketConn) SetWriteDeadline(t time.Time) error {
 	return d.conn.SetWriteDeadline(t)
 }
 
-// NewKCPOverDTLS creates a KCP session over a DTLS connection.
+// NewKCPOverPacketConn creates a KCP session over a packet transport.
 // isServer: true for server-side (listener), false for client-side (dialer).
-func NewKCPOverDTLS(dtlsConn net.Conn, isServer bool) (*kcp.UDPSession, error) {
-	pc := NewDtlsPacketConn(dtlsConn)
-
+func NewKCPOverPacketConn(pc net.PacketConn, remote net.Addr, isServer bool) (*kcp.UDPSession, error) {
 	block, err := kcp.NewNoneBlockCrypt(nil) // DTLS already encrypts
 	if err != nil {
 		return nil, err
@@ -75,7 +73,7 @@ func NewKCPOverDTLS(dtlsConn net.Conn, isServer bool) (*kcp.UDPSession, error) {
 		}
 	} else {
 		// Client: dial through the PacketConn
-		sess, err = kcp.NewConn2(dtlsConn.RemoteAddr(), block, 0, 0, pc)
+		sess, err = kcp.NewConn2(remote, block, 0, 0, pc)
 		if err != nil {
 			return nil, err
 		}
@@ -90,6 +88,12 @@ func NewKCPOverDTLS(dtlsConn net.Conn, isServer bool) (*kcp.UDPSession, error) {
 	sess.SetACKNoDelay(true)
 
 	return sess, nil
+}
+
+// NewKCPOverDTLS creates a KCP session over a DTLS connection.
+// isServer: true for server-side (listener), false for client-side (dialer).
+func NewKCPOverDTLS(dtlsConn net.Conn, isServer bool) (*kcp.UDPSession, error) {
+	return NewKCPOverPacketConn(NewDtlsPacketConn(dtlsConn), dtlsConn.RemoteAddr(), isServer)
 }
 
 // DefaultSmuxConfig returns smux config tuned for TURN tunnel.

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -295,43 +296,31 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 	}
 	code := int(codeFloat)
 
-	// Extract redirect_uri
-	RedirectURI, ok := errData["redirect_uri"].(string)
-	if !ok {
-		log.Printf("missing redirect_uri in captcha error data")
-		return nil
+	// Modern VK captcha payloads carry redirect_uri/session_token for
+	// captchaNotRobot. Legacy payloads can be image-only and still need to flow
+	// into the manual fallback instead of being treated as a generic API error.
+	redirectURI, _ := errData["redirect_uri"].(string)
+
+	// captcha_sid is present on legacy image captcha payloads, but newer
+	// redirect/session-token payloads may rely on success_token instead.
+	var captchaSid string
+	if sidText, ok := errData["captcha_sid"].(string); ok {
+		captchaSid = sidText
+	} else if sidNum, ok := errData["captcha_sid"].(float64); ok {
+		captchaSid = fmt.Sprintf("%.0f", sidNum)
 	}
 
-	// Extract captcha_sid
-	captchaSid, ok := errData["captcha_sid"].(string)
-	if !ok {
-		// try numeric
-		if sidNum, ok2 := errData["captcha_sid"].(float64); ok2 {
-			captchaSid = fmt.Sprintf("%.0f", sidNum)
-		} else {
-			log.Printf("missing captcha_sid in captcha error data")
-			return nil
-		}
-	}
+	// New VK captcha payloads can be redirect/session-token only. captcha_img is
+	// still useful for the legacy manual image fallback, but it is not required
+	// for automatic captchaNotRobot solving.
+	captchaImg, _ := errData["captcha_img"].(string)
 
-	// Extract captcha_img
-	captchaImg, ok := errData["captcha_img"].(string)
-	if !ok {
-		log.Printf("missing captcha_img in captcha error data")
-		return nil
-	}
-
-	// Extract error_msg
-	errorMsg, ok := errData["error_msg"].(string)
-	if !ok {
-		log.Printf("missing error_msg in captcha error data")
-		return nil
-	}
+	errorMsg, _ := errData["error_msg"].(string)
 
 	// Extract session token if redirect_uri present
 	var sessionToken string
-	if RedirectURI != "" {
-		if parsed, err := neturl.Parse(RedirectURI); err == nil {
+	if redirectURI != "" {
+		if parsed, err := neturl.Parse(redirectURI); err == nil {
 			sessionToken = parsed.Query().Get("session_token")
 		} else {
 			log.Printf("failed to parse redirect_uri: %v", err)
@@ -361,13 +350,18 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		captchaAttempt = attStr
 	}
 
+	if redirectURI == "" && captchaImg != "" && captchaSid == "" {
+		log.Printf("missing captcha_sid in image captcha error data")
+		return nil
+	}
+
 	// Build VkCaptchaError
 	return &VkCaptchaError{
 		ErrorCode:               code,
 		ErrorMsg:                errorMsg,
 		CaptchaSid:              captchaSid,
 		CaptchaImg:              captchaImg,
-		RedirectURI:             RedirectURI,
+		RedirectURI:             redirectURI,
 		IsSoundCaptchaAvailable: isSound,
 		SessionToken:            sessionToken,
 		CaptchaTs:               captchaTs,
@@ -376,7 +370,7 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 }
 
 func (e *VkCaptchaError) IsCaptchaError() bool {
-	return e.ErrorCode == 14 && e.RedirectURI != "" && e.SessionToken != ""
+	return e.ErrorCode == 14 && ((e.RedirectURI != "" && e.SessionToken != "") || e.CaptchaImg != "")
 }
 
 func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID int, client tlsclient.HttpClient, profile Profile, useSliderPOC bool) (string, error) {
@@ -618,12 +612,14 @@ type StreamCredentialsCache struct {
 }
 
 const (
-	credentialLifetime = 10 * time.Minute
-	cacheSafetyMargin  = 60 * time.Second
-	maxCacheErrors     = 3
-	errorWindow        = 10 * time.Second
-	streamsPerCache    = 10
+	credentialLifetime     = 10 * time.Minute
+	cacheSafetyMargin      = 60 * time.Second
+	maxCacheErrors         = 3
+	errorWindow            = 10 * time.Second
+	defaultStreamsPerCache = 10
 )
+
+var streamsPerCache = defaultStreamsPerCache
 
 func getCacheID(streamID int) int {
 	return streamID / streamsPerCache
@@ -916,6 +912,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		if errObj, hasErr := resp["error"].(map[string]interface{}); hasErr {
 			captchaErr := ParseVkCaptchaError(errObj)
 			if captchaErr != nil && captchaErr.IsCaptchaError() {
+				log.Printf("[STREAM %d] [Captcha] VK captcha received (redirect: %t, image: %t, sid: %t)", streamID, captchaErr.RedirectURI != "", captchaErr.CaptchaImg != "", captchaErr.CaptchaSid != "")
 				solveMode, hasSolveMode := captchaSolveModeForAttempt(attempt, manualCaptcha, autoCaptchaSliderPOC)
 				if !hasSolveMode {
 					log.Printf("[STREAM %d] [Captcha] No more solve modes available (attempt %d)", streamID, attempt+1)
@@ -1807,15 +1804,47 @@ func main() {
 	yalink := flag.String("yandex-link", "", "Yandex telemost invite link \"https://telemost.yandex.ru/j/...\"")
 	peerAddr := flag.String("peer", "", "peer server address (host:port)")
 	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
+	streamsPerCred := flag.Int("streams-per-cred", defaultStreamsPerCache, "TURN streams that share one credential cache")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
-	vlessBond := flag.Bool("vless-bond", false, "VLESS bond mode: use the VLESS session pool across TURN/DTLS streams; requires -vless")
+	vlessBond := flag.Bool("vless-bond", false, "VLESS bond mode: packet-level multipath across TURN/DTLS streams; requires -vless")
+	dnsMode := flag.String("dns", "auto", "DNS mode for VK resolver: auto, udp, or doh")
+	dnsServers := flag.String("dns-servers", "", "comma-separated DNS resolvers for VK auth, with optional ports")
+	wrap := flag.Bool("wrap", false, "accept WRAP compatibility mode")
+	wrapKey := flag.String("wrap-key", "", "64-hex WRAP key")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "generate a 64-hex WRAP key and exit")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	flag.Parse()
+	if *genWrapKey {
+		key, keyErr := generateWrapKey()
+		if keyErr != nil {
+			log.Fatalf("generate wrap key: %s", keyErr)
+		}
+		fmt.Println(key)
+		return
+	}
 	if err := validateClientVLESSFlags(*vlessMode, *vlessBond, *n); err != nil {
 		log.Fatalf("%s", err)
+	}
+	if err := validateClientCompatibilityFlags(*dnsMode, *wrap, *wrapKey); err != nil {
+		log.Fatalf("%s", err)
+	}
+	streamsPerCache = normalizeStreamsPerCredential(*streamsPerCred)
+	resolvers := defaultDNSResolvers
+	if strings.TrimSpace(*dnsServers) != "" {
+		parsedResolvers, parseErr := parseDNSServers(*dnsServers)
+		if parseErr != nil {
+			log.Fatalf("bad -dns-servers: %s", parseErr)
+		}
+		resolvers = parsedResolvers
+	}
+	if strings.EqualFold(strings.TrimSpace(*dnsMode), "doh") {
+		log.Printf("DNS mode doh requested; this core uses UDP resolvers for VK auth")
+	}
+	if *wrap {
+		log.Printf("wrap mode: requested; compatibility flags accepted, packet wrapping is not implemented in this build")
 	}
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
@@ -1839,7 +1868,7 @@ func main() {
 		link = parts[len(parts)-1]
 
 		dialer := dnsdialer.New(
-			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"),
+			dnsdialer.WithResolvers(resolvers...),
 			dnsdialer.WithStrategy(dnsdialer.Fallback{}),
 			dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
 		)
@@ -2014,6 +2043,15 @@ func (p *sessionPool) count() int {
 	return len(p.sessions)
 }
 
+var defaultDNSResolvers = []string{
+	"77.88.8.8:53",
+	"77.88.8.1:53",
+	"8.8.8.8:53",
+	"8.8.4.4:53",
+	"1.1.1.1:53",
+	"1.0.0.1:53",
+}
+
 func validateClientVLESSFlags(vlessMode, vlessBond bool, streamCount int) error {
 	if vlessBond && !vlessMode {
 		return fmt.Errorf("-vless-bond requires -vless")
@@ -2031,18 +2069,95 @@ func normalizeVLESSSessionCount(streamCount int) int {
 	return streamCount
 }
 
+func normalizeStreamsPerCredential(streams int) int {
+	if streams <= 0 {
+		return defaultStreamsPerCache
+	}
+	return streams
+}
+
+func parseDNSServers(raw string) ([]string, error) {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	servers := make([]string, 0, len(parts))
+	for _, part := range parts {
+		addr := strings.TrimSpace(part)
+		if addr == "" {
+			continue
+		}
+		normalized := addr
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			normalized = net.JoinHostPort(addr, "53")
+		}
+		host, port, err := net.SplitHostPort(normalized)
+		if err != nil {
+			return nil, fmt.Errorf("bad resolver %q: %w", addr, err)
+		}
+		if host == "" {
+			return nil, fmt.Errorf("bad resolver %q: empty host", addr)
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return nil, fmt.Errorf("bad resolver %q: invalid port", addr)
+		}
+		servers = append(servers, normalized)
+	}
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no DNS servers provided")
+	}
+	return servers, nil
+}
+
+func validateClientCompatibilityFlags(dnsMode string, wrap bool, wrapKey string) error {
+	switch strings.ToLower(strings.TrimSpace(dnsMode)) {
+	case "", "auto", "udp", "doh":
+	default:
+		return fmt.Errorf("unsupported -dns mode %q (expected auto, udp, or doh)", dnsMode)
+	}
+	if wrap && !isHexKey64(wrapKey) {
+		return fmt.Errorf("bad -wrap-key (need 64 hex)")
+	}
+	return nil
+}
+
+func isHexKey64(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func generateWrapKey() (string, error) {
+	var key [32]byte
+	if _, err := cryptorand.Read(key[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(key[:]), nil
+}
+
+func generateBondID() (string, error) {
+	var id [16]byte
+	if _, err := cryptorand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
+}
+
 // runVLESSMode implements TCP forwarding with round-robin across N TURN sessions.
-// With vlessBond enabled the bond semantics are connection-level: one TCP
-// connection is pinned to one smux session, while different TCP connections are
-// distributed across the active TURN/DTLS session pool.
+// Without vlessBond, one TCP connection is pinned to one smux session, while
+// different TCP connections are distributed across the active TURN/DTLS pool.
 func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int, vlessBond bool) {
+	if vlessBond {
+		runVLESSBondMode(ctx, tp, peer, listenAddr, numSessions)
+		return
+	}
+
 	numSessions = normalizeVLESSSessionCount(numSessions)
 	pool := &sessionPool{}
 	log.Printf("vless mode: enabled")
 	log.Printf("vless bond: %s", enabledText(vlessBond))
-	if vlessBond {
-		log.Printf("vless bond semantics: connection-level session pool; single TCP connection remains on one smux session")
-	}
 
 	// Start N session maintainers with staggered startup
 	var wgMaint sync.WaitGroup
@@ -2117,6 +2232,109 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 	}
 }
 
+func runVLESSBondMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
+	numSessions = normalizeVLESSSessionCount(numSessions)
+	bondID, err := generateBondID()
+	if err != nil {
+		log.Panicf("generate vless bond id: %s", err)
+	}
+	bonded := tcputil.NewBondedPacketConn("vless-bond-client:" + bondID)
+	defer func() { _ = bonded.Close() }()
+
+	log.Printf("vless mode: enabled")
+	log.Printf("vless bond: enabled")
+	log.Printf("vless bond semantics: packet-level multipath over %d TURN/DTLS paths", numSessions)
+
+	var wgMaint sync.WaitGroup
+	for i := 0; i < numSessions; i++ {
+		wgMaint.Add(1)
+		go func(id int) {
+			defer wgMaint.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(id) * 300 * time.Millisecond):
+			}
+			maintainVLESSBondPath(ctx, tp, peer, id, bondID, bonded)
+		}(i)
+	}
+
+	log.Printf("VLESS bond: waiting for first path to connect (total: %d)...", numSessions)
+	for {
+		select {
+		case <-ctx.Done():
+			_ = bonded.Close()
+			wgMaint.Wait()
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+		if bonded.Count() > 0 {
+			break
+		}
+	}
+
+	kcpSess, err := tcputil.NewKCPOverPacketConn(bonded, bonded.RemoteAddr(), false)
+	if err != nil {
+		_ = bonded.Close()
+		wgMaint.Wait()
+		log.Panicf("VLESS bond KCP session: %s", err)
+	}
+	defer func() { _ = kcpSess.Close() }()
+	log.Printf("KCP session established (vless bond)")
+
+	smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
+	if err != nil {
+		_ = bonded.Close()
+		wgMaint.Wait()
+		log.Panicf("VLESS bond smux client: %s", err)
+	}
+	defer func() { _ = smuxSess.Close() }()
+	log.Printf("smux session established (vless bond)")
+
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Panicf("TCP listen: %s", err)
+	}
+	context.AfterFunc(ctx, func() { _ = listener.Close() })
+	log.Printf("VLESS bond: listening on %s (single smux session, %d bonded paths)", listenAddr, numSessions)
+
+	var wgConn sync.WaitGroup
+	for {
+		tcpConn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				wgConn.Wait()
+				_ = bonded.Close()
+				wgMaint.Wait()
+				return
+			default:
+			}
+			log.Printf("TCP accept error: %s", err)
+			continue
+		}
+
+		if smuxSess.IsClosed() {
+			log.Printf("VLESS bond smux session is closed, rejecting connection")
+			_ = tcpConn.Close()
+			continue
+		}
+
+		wgConn.Add(1)
+		go func(tc net.Conn) {
+			defer wgConn.Done()
+			defer func() { _ = tc.Close() }()
+			stream, err := smuxSess.OpenStream()
+			if err != nil {
+				log.Printf("smux open stream error: %s", err)
+				return
+			}
+			defer func() { _ = stream.Close() }()
+			pipe(ctx, tc, stream)
+		}(tcpConn)
+	}
+}
+
 func enabledText(enabled bool) string {
 	if enabled {
 		return "enabled"
@@ -2169,14 +2387,100 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 	}
 }
 
+func maintainVLESSBondPath(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, bondID string, bonded *tcputil.BondedPacketConn) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		dtlsConn, cleanup, err := createDTLSConnection(ctx, tp, peer, id)
+		if err != nil {
+			log.Printf("[bond path %d] setup error: %s, retrying...", id, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+
+		if err := tcputil.WriteBondHello(dtlsConn, bondID); err != nil {
+			log.Printf("[bond path %d] hello error: %s, retrying...", id, err)
+			cleanup()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+
+		done := bonded.AddConn(dtlsConn, cleanup)
+		log.Printf("[bond path %d] connected (active: %d)", id, bonded.Count())
+
+		select {
+		case <-ctx.Done():
+			_ = bonded.Close()
+			return
+		case <-done:
+			log.Printf("[bond path %d] disconnected (active: %d), reconnecting...", id, bonded.Count())
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 // createSmuxSession establishes a full TURN+DTLS+KCP+smux pipeline and returns
 // the smux session along with a cleanup function to tear down all layers.
 func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int) (*smux.Session, func(), error) {
-	var cleanupFns []func()
-	cleanup := func() {
+	dtlsConn, cleanup, err := createDTLSConnection(ctx, tp, peer, id)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cleanupFns := []func(){cleanup}
+	cleanupAll := func() {
 		for i := len(cleanupFns) - 1; i >= 0; i-- {
 			cleanupFns[i]()
 		}
+	}
+
+	// Create KCP session over DTLS
+	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, false)
+	if err != nil {
+		cleanupAll()
+		return nil, nil, fmt.Errorf("KCP session: %w", err)
+	}
+	cleanupFns = append(cleanupFns, func() { _ = kcpSess.Close() })
+	log.Printf("KCP session established")
+
+	// Create smux client session over KCP
+	smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
+	if err != nil {
+		cleanupAll()
+		return nil, nil, fmt.Errorf("smux client: %w", err)
+	}
+	cleanupFns = append(cleanupFns, func() { _ = smuxSess.Close() })
+	log.Printf("smux session established")
+
+	return smuxSess, cleanupAll, nil
+}
+
+func createDTLSConnection(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int) (net.Conn, func(), error) {
+	var cleanupFns []func()
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			for i := len(cleanupFns) - 1; i >= 0; i-- {
+				cleanupFns[i]()
+			}
+		})
 	}
 
 	// 1. Get TURN credentials
@@ -2200,7 +2504,7 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		return nil, nil, fmt.Errorf("resolve TURN addr: %w", err)
 	}
 	turnServerAddr = turnServerUDPAddr.String()
-	fmt.Println(turnServerUDPAddr.IP)
+	log.Printf("[session %d] TURN server IP: %s", id, turnServerUDPAddr.IP)
 
 	// 2. Connect to TURN server
 	var turnConn net.PacketConn
@@ -2284,27 +2588,11 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		return nil, nil, fmt.Errorf("DTLS handshake: %w", err)
 	}
 	cleanupFns = append(cleanupFns, func() { _ = dtlsConn.Close() })
+	connectedStreams.Add(1)
+	cleanupFns = append(cleanupFns, func() { connectedStreams.Add(-1) })
 	log.Printf("DTLS connection established")
 
-	// 5. Create KCP session over DTLS
-	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, false)
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("KCP session: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { _ = kcpSess.Close() })
-	log.Printf("KCP session established")
-
-	// 6. Create smux client session over KCP
-	smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("smux client: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { _ = smuxSess.Close() })
-	log.Printf("smux session established")
-
-	return smuxSess, cleanup, nil
+	return dtlsConn, cleanup, nil
 }
 
 // relayPacketConn wraps a TURN relay PacketConn to direct all writes to the peer.

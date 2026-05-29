@@ -546,9 +546,21 @@ Xray сервер (config.json)
 ./client -peer VPS_IP:56000 -vk-link "..." -listen 127.0.0.1:9000 -n 10 -vless -vless-bond
 ```
 
-Current semantics are connection-level bonding: the client maintains the configured session pool and round-robins new local TCP connections across active TURN/DTLS+KCP+smux sessions. A single long-lived TCP connection remains pinned to the smux session it opened on; this is not byte-level multipath aggregation.
+Current semantics are packet-level bonding. The client creates one KCP/smux transport over a `BondedPacketConn`, while each TURN/DTLS stream becomes a path inside that logical packet transport. A single long-lived VLESS/full-tunnel TCP connection can therefore use several TURN/DTLS paths instead of being pinned to one path.
 
-Readiness is separate from stream count. The client may start serving after the first active VLESS session, but the remaining `-n` sessions continue connecting and join the pool as they become available. `-vless-bond` without `-vless` exits with `-vless-bond requires -vless`.
+Readiness is separate from stream count. The client may start serving after the first active VLESS bond path, but the remaining `-n` paths continue connecting and join the same bonded transport as they become available. `-vless-bond` without `-vless` exits with `-vless-bond requires -vless`.
+
+## Android compatibility flags
+
+The Android wrapper may pass these client flags depending on saved profile settings:
+
+```bash
+-streams-per-cred 4 -dns udp -dns-servers 1.1.1.1:53 -wrap -wrap-key <64-hex>
+```
+
+The bundled client accepts them so Android profiles do not fail with Go flag exit code `2`. `-streams-per-cred` controls how many TURN streams share one credential cache. `-dns-servers` overrides the VK auth resolver list; `-dns=doh` is accepted for compatibility but this core currently falls back to UDP resolvers for VK auth.
+
+`-gen-wrap-key` prints a fresh 64-hex key for the Android SSH control script. The public core currently accepts `-wrap/-wrap-key` as compatibility flags and logs that packet wrapping is not implemented in this build; use a WRAP-capable core if you need actual packet wrapping.
 
 ## Direct mode
 

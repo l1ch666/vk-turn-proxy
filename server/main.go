@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -23,17 +25,34 @@ func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
-	vlessBond := flag.Bool("vless-bond", false, "VLESS bond mode: accept multiple VLESS TURN sessions; requires -vless")
+	vlessBond := flag.Bool("vless-bond", false, "VLESS bond mode: packet-level multipath across TURN/DTLS streams; requires -vless")
+	wrap := flag.Bool("wrap", false, "accept WRAP compatibility mode")
+	wrapKey := flag.String("wrap-key", "", "64-hex WRAP key")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "generate a 64-hex WRAP key and exit")
 	flag.Parse()
+	if *genWrapKey {
+		key, keyErr := generateWrapKey()
+		if keyErr != nil {
+			log.Fatalf("generate wrap key: %s", keyErr)
+		}
+		fmt.Println(key)
+		return
+	}
 	if err := validateServerVLESSFlags(*vlessMode, *vlessBond); err != nil {
+		log.Fatalf("%s", err)
+	}
+	if err := validateServerCompatibilityFlags(*wrap, *wrapKey); err != nil {
 		log.Fatalf("%s", err)
 	}
 	log.Printf("vless mode: %s", enabledText(*vlessMode))
 	if *vlessMode {
 		log.Printf("vless bond: %s", enabledText(*vlessBond))
 		if *vlessBond {
-			log.Printf("vless bond semantics: connection-level session pool; single TCP connection remains on one smux session")
+			log.Printf("vless bond semantics: packet-level multipath over TURN/DTLS paths")
 		}
+	}
+	if *wrap {
+		log.Printf("wrap mode: requested; compatibility flags accepted, packet wrapping is not implemented in this build")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -84,6 +103,10 @@ func main() {
 	})
 
 	fmt.Println("Listening")
+	var bondManager *vlessBondManager
+	if *vlessMode && *vlessBond {
+		bondManager = newVLESSBondManager(*connect)
+	}
 
 	wg1 := sync.WaitGroup{}
 	for {
@@ -102,7 +125,11 @@ func main() {
 		wg1.Add(1)
 		go func(conn net.Conn) {
 			defer wg1.Done()
+			ownsConn := true
 			defer func() {
+				if !ownsConn {
+					return
+				}
 				if closeErr := conn.Close(); closeErr != nil {
 					log.Printf("failed to close incoming connection: %s", closeErr)
 				}
@@ -126,6 +153,15 @@ func main() {
 			log.Println("Handshake done")
 
 			if *vlessMode {
+				if *vlessBond {
+					if err := bondManager.Add(ctx, dtlsConn); err != nil {
+						log.Printf("VLESS bond path rejected: %s", err)
+						return
+					}
+					ownsConn = false
+					log.Printf("VLESS bond path accepted: %s\n", conn.RemoteAddr())
+					return
+				}
 				handleVLESSConnection(ctx, dtlsConn, *connect)
 			} else {
 				handleUDPConnection(ctx, conn, *connect)
@@ -143,11 +179,123 @@ func validateServerVLESSFlags(vlessMode, vlessBond bool) error {
 	return nil
 }
 
+func validateServerCompatibilityFlags(wrap bool, wrapKey string) error {
+	if wrap && !isHexKey64(wrapKey) {
+		return fmt.Errorf("bad -wrap-key (need 64 hex)")
+	}
+	return nil
+}
+
+func isHexKey64(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func generateWrapKey() (string, error) {
+	var key [32]byte
+	if _, err := cryptorand.Read(key[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(key[:]), nil
+}
+
 func enabledText(enabled bool) string {
 	if enabled {
 		return "enabled"
 	}
 	return "disabled"
+}
+
+type vlessBondManager struct {
+	connectAddr string
+	mu          sync.Mutex
+	groups      map[string]*vlessBondGroup
+}
+
+func newVLESSBondManager(connectAddr string) *vlessBondManager {
+	return &vlessBondManager{
+		connectAddr: connectAddr,
+		groups:      make(map[string]*vlessBondGroup),
+	}
+}
+
+func (m *vlessBondManager) Add(ctx context.Context, conn net.Conn) error {
+	bondID, err := tcputil.ReadBondHello(conn)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	group := m.groups[bondID]
+	if group == nil {
+		group = &vlessBondGroup{
+			id:          bondID,
+			connectAddr: m.connectAddr,
+			pc:          tcputil.NewBondedPacketConn("vless-bond-server:" + bondID),
+		}
+		m.groups[bondID] = group
+		go group.run(ctx, func() {
+			m.mu.Lock()
+			delete(m.groups, bondID)
+			m.mu.Unlock()
+		})
+	}
+	m.mu.Unlock()
+
+	group.add(conn)
+	return nil
+}
+
+type vlessBondGroup struct {
+	id          string
+	connectAddr string
+	pc          *tcputil.BondedPacketConn
+}
+
+func (g *vlessBondGroup) add(conn net.Conn) {
+	g.pc.AddConn(conn, nil)
+	log.Printf("VLESS bond %s: path connected (active: %d)", g.shortID(), g.pc.Count())
+}
+
+func (g *vlessBondGroup) run(ctx context.Context, onDone func()) {
+	defer onDone()
+	defer func() { _ = g.pc.Close() }()
+
+	kcpSess, err := tcputil.NewKCPOverPacketConn(g.pc, g.pc.RemoteAddr(), true)
+	if err != nil {
+		log.Printf("VLESS bond %s: KCP session error: %s", g.shortID(), err)
+		return
+	}
+	defer func() {
+		if err := kcpSess.Close(); err != nil {
+			log.Printf("VLESS bond %s: failed to close KCP session: %v", g.shortID(), err)
+		}
+	}()
+	log.Printf("KCP session established (vless bond server, id=%s)", g.shortID())
+
+	smuxSess, err := smux.Server(kcpSess, tcputil.DefaultSmuxConfig())
+	if err != nil {
+		log.Printf("VLESS bond %s: smux server error: %s", g.shortID(), err)
+		return
+	}
+	defer func() {
+		if err := smuxSess.Close(); err != nil {
+			log.Printf("VLESS bond %s: failed to close smux session: %v", g.shortID(), err)
+		}
+	}()
+	log.Printf("smux session established (vless bond server, id=%s)", g.shortID())
+
+	serveSmuxSession(ctx, smuxSess, g.connectAddr)
+}
+
+func (g *vlessBondGroup) shortID() string {
+	if len(g.id) <= 8 {
+		return g.id
+	}
+	return g.id[:8]
 }
 
 // handleUDPConnection forwards DTLS packets to a UDP backend (WireGuard).
@@ -268,7 +416,10 @@ func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr s
 	}()
 	log.Printf("smux session established (server)")
 
-	// 3. Accept smux streams and forward to backend via TCP
+	serveSmuxSession(ctx, smuxSess, connectAddr)
+}
+
+func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr string) {
 	var wg sync.WaitGroup
 	for {
 		stream, err := smuxSess.AcceptStream()
