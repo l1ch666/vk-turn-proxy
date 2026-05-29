@@ -468,7 +468,7 @@ func solvePoW(powInput string, difficulty int) string {
 
 func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, client tlsclient.HttpClient, profile Profile) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
-		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
+		reqURL := captchaAPIBaseURL + method + "?v=5.131"
 		parsedURL, err := neturl.Parse(reqURL)
 		if err != nil {
 			return nil, fmt.Errorf("parse request URL: %w", err)
@@ -502,7 +502,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 		return resp, nil
 	}
 
-	baseParams := fmt.Sprintf("session_token=%s&domain=vk.com&adFp=&access_token=", neturl.QueryEscape(sessionToken))
+	baseParams := fmt.Sprintf("session_token=%s&domain=vk.com&adFp=%s&access_token=", neturl.QueryEscape(sessionToken), neturl.QueryEscape(generateAdFp()))
 
 	log.Printf("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
 	if _, err := vkReq("captchaNotRobot.settings", baseParams); err != nil {

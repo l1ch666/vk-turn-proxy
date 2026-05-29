@@ -104,7 +104,7 @@ func TestApplyCaptchaAPIHeadersMatchesBrowserXHR(t *testing.T) {
 		SecChUaMobile:   "?0",
 		SecChUaPlatform: `"Windows"`,
 	}
-	req, err := fhttp.NewRequest("POST", "https://api.vk.ru/method/captchaNotRobot.getContent?v=5.131", strings.NewReader("session_token=s"))
+	req, err := fhttp.NewRequest("POST", captchaAPIBaseURL+"captchaNotRobot.getContent?v=5.131", strings.NewReader("session_token=s"))
 	if err != nil {
 		t.Fatalf("NewRequest failed: %v", err)
 	}
@@ -118,6 +118,37 @@ func TestApplyCaptchaAPIHeadersMatchesBrowserXHR(t *testing.T) {
 	assertHeader(t, req, "Sec-Fetch-Mode", "cors")
 	assertHeader(t, req, "Sec-Fetch-Dest", "empty")
 	assertHeader(t, req, "User-Agent", profile.UserAgent)
+}
+
+func TestCaptchaSessionBaseValuesIncludesGeneratedAdFp(t *testing.T) {
+	t.Parallel()
+
+	session := newCaptchaNotRobotSession(t.Context(), "session-token", "hash", 1, nil, Profile{})
+	values := session.baseValues()
+
+	if values.Get("session_token") != "session-token" {
+		t.Fatalf("session_token = %q", values.Get("session_token"))
+	}
+	adFp := values.Get("adFp")
+	if len(adFp) != adFpLength {
+		t.Fatalf("adFp length = %d, want %d (%q)", len(adFp), adFpLength, adFp)
+	}
+	for _, r := range adFp {
+		if !strings.ContainsRune(adFpAlphabet, r) {
+			t.Fatalf("adFp contains unexpected rune %q in %q", r, adFp)
+		}
+	}
+	if adFp != session.baseValues().Get("adFp") {
+		t.Fatal("adFp should stay stable within one captcha session")
+	}
+}
+
+func TestCaptchaAPIBaseURLUsesVkCom(t *testing.T) {
+	t.Parallel()
+
+	if captchaAPIBaseURL != "https://api.vk.com/method/" {
+		t.Fatalf("captchaAPIBaseURL = %q", captchaAPIBaseURL)
+	}
 }
 
 func assertHeader(t *testing.T, req *fhttp.Request, key string, want string) {
@@ -167,15 +198,15 @@ func TestRankSliderCandidatesPrefersMostCoherentImage(t *testing.T) {
 		}
 	}
 
-	candidates, err := rankSliderCandidates(src, 3, []int{0, 1, 0, 1})
+	candidates, err := rankSliderCandidates(src, 3, []int{0, 1, 0, 1, 2, 2})
 	if err != nil {
 		t.Fatalf("rankSliderCandidates returned error: %v", err)
 	}
 
-	if len(candidates) != 2 {
-		t.Fatalf("expected 2 candidates, got %d", len(candidates))
+	if len(candidates) != 3 {
+		t.Fatalf("expected 3 candidates, got %d", len(candidates))
 	}
-	if candidates[0].Index != 2 {
+	if candidates[0].Index != 3 {
 		t.Fatalf("expected solved candidate to rank first, got candidate %d", candidates[0].Index)
 	}
 }
@@ -203,6 +234,31 @@ func TestEncodeSliderAnswer(t *testing.T) {
 	expected := []int{9, 10, 2}
 	if !reflect.DeepEqual(payload.Value, expected) {
 		t.Fatalf("expected payload %v, got %v", expected, payload.Value)
+	}
+}
+
+func TestBuildSliderActiveStepsMatchesVkSliderSlice(t *testing.T) {
+	t.Parallel()
+
+	swaps := []int{13, 2, 24, 1, 19, 20, 5, 6}
+	cases := []struct {
+		name     string
+		position int
+		want     []int
+	}{
+		{name: "first odd position", position: 1, want: []int{13, 2}},
+		{name: "second even position reuses previous pair", position: 2, want: []int{13, 2}},
+		{name: "third odd position includes three pairs", position: 3, want: []int{13, 2, 24, 1, 19, 20}},
+		{name: "fourth even position also includes three pairs", position: 4, want: []int{13, 2, 24, 1, 19, 20}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildSliderActiveSteps(swaps, tc.position)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("buildSliderActiveSteps(%d) = %v, want %v", tc.position, got, tc.want)
+			}
+		})
 	}
 }
 

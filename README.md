@@ -564,7 +564,7 @@ The bundled client accepts them so Android profiles do not fail with Go flag exi
 
 ## VK captcha notes
 
-The client supports VK `captchaNotRobot` redirect/session-token payloads and legacy image payloads. Slider/check API requests reuse the same browser XHR headers (`Origin`, `Referer`, `Sec-Fetch-*`, client hints) as the checkbox flow; missing these headers can make VK return `status=ERROR` on `captchaNotRobot.check` or `captchaNotRobot.getContent` and force manual fallback.
+The client supports VK `captchaNotRobot` redirect/session-token payloads and legacy image payloads. Slider/check API requests use `api.vk.com`, reuse the same browser XHR headers (`Origin`, `Referer`, `Sec-Fetch-*`, client hints) as the checkbox flow, and send a generated non-empty `adFp` fingerprint. Missing these details can make VK return `status=ERROR` on `captchaNotRobot.check` or `captchaNotRobot.getContent` and force manual fallback. Slider answers follow VK's step slicing formula so the submitted `answer.value` matches the widget's own output.
 
 ## Direct mode
 

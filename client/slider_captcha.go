@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	_ "image/jpeg"
 	"io"
 	"log"
+	mathrand "math/rand"
 	neturl "net/url"
 	"regexp"
 	"sort"
@@ -23,9 +25,12 @@ import (
 )
 
 const (
+	captchaAPIBaseURL     = "https://api.vk.com/method/"
 	captchaDebugInfo      = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
 	sliderCaptchaType     = "slider"
 	defaultSliderAttempts = 4
+	adFpLength            = 21
+	adFpAlphabet          = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-"
 )
 
 type captchaNotRobotSession struct {
@@ -36,6 +41,7 @@ type captchaNotRobotSession struct {
 	client       tlsclient.HttpClient
 	profile      Profile
 	browserFp    string
+	adFp         string
 }
 
 type captchaSettingsResponse struct {
@@ -84,6 +90,7 @@ func newCaptchaNotRobotSession(
 		client:       client,
 		profile:      profile,
 		browserFp:    generateBrowserFp(profile),
+		adFp:         generateAdFp(),
 	}
 }
 
@@ -91,13 +98,13 @@ func (s *captchaNotRobotSession) baseValues() neturl.Values {
 	values := neturl.Values{}
 	values.Set("session_token", s.sessionToken)
 	values.Set("domain", "vk.com")
-	values.Set("adFp", "")
+	values.Set("adFp", s.adFp)
 	values.Set("access_token", "")
 	return values
 }
 
 func (s *captchaNotRobotSession) request(method string, values neturl.Values) (map[string]interface{}, error) {
-	reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
+	reqURL := captchaAPIBaseURL + method + "?v=5.131"
 	parsedURL, err := neturl.Parse(reqURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse request URL: %w", err)
@@ -142,6 +149,27 @@ func applyCaptchaAPIHeaders(req *fhttp.Request, profile Profile) {
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-GPC", "1")
 	req.Header.Set("Priority", "u=1, i")
+}
+
+func generateAdFp() string {
+	var raw [adFpLength]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return fallbackAdFp()
+	}
+
+	out := make([]byte, adFpLength)
+	for i, b := range raw {
+		out[i] = adFpAlphabet[int(b)&63]
+	}
+	return string(out)
+}
+
+func fallbackAdFp() string {
+	out := make([]byte, adFpLength)
+	for i := range out {
+		out[i] = adFpAlphabet[mathrand.Intn(len(adFpAlphabet))]
+	}
+	return string(out)
 }
 
 func (s *captchaNotRobotSession) requestSettings() (*captchaSettingsResponse, error) {
@@ -681,6 +709,12 @@ func buildSliderActiveSteps(swaps []int, candidateIndex int) []int {
 	}
 
 	end := candidateIndex * 2
+	if candidateIndex%2 == 0 {
+		end -= 2
+	}
+	if end < 0 {
+		end = 0
+	}
 	if end > len(swaps) {
 		end = len(swaps)
 	}
