@@ -2096,6 +2096,40 @@ func (p *sessionPool) pick() *smux.Session {
 	return p.sessions[idx]
 }
 
+// pickLeastLoaded returns the live session currently carrying the fewest smux
+// streams, so a new TCP connection avoids a session whose TURN/DTLS path has
+// stalled (head-of-line) and isn't draining. This is a strict upgrade over the
+// blind round-robin pick(): with a single session it behaves identically, and
+// with N sessions it spreads load by actual occupancy instead of a counter.
+// Round-robin (via the shared counter) breaks ties so equal-load sessions still
+// rotate. Closed sessions are skipped.
+func (p *sessionPool) pickLeastLoaded() *smux.Session {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := len(p.sessions)
+	if n == 0 {
+		return nil
+	}
+	start := int(p.counter.Add(1) % uint64(n))
+	var best *smux.Session
+	bestLoad := int(^uint(0) >> 1) // max int
+	for i := 0; i < n; i++ {
+		s := p.sessions[(start+i)%n]
+		if s.IsClosed() {
+			continue
+		}
+		load := s.NumStreams()
+		if load < bestLoad {
+			bestLoad = load
+			best = s
+			if load == 0 {
+				break // can't do better than an idle session
+			}
+		}
+	}
+	return best
+}
+
 func (p *sessionPool) count() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -2252,7 +2286,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 		log.Panicf("TCP listen: %s", err)
 	}
 	context.AfterFunc(ctx, func() { _ = listener.Close() })
-	log.Printf("VLESS mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
+	log.Printf("VLESS mode: listening on %s (least-loaded across %d sessions)", listenAddr, numSessions)
 
 	var wgConn sync.WaitGroup
 	for {
@@ -2269,7 +2303,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 			continue
 		}
 
-		sess := pool.pick()
+		sess := pool.pickLeastLoaded()
 		if sess == nil || sess.IsClosed() {
 			log.Printf("No active sessions, rejecting connection")
 			_ = tcpConn.Close()
