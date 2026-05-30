@@ -1873,6 +1873,7 @@ func main() {
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	tlsProfileFlag := flag.String("tls-profile", "", "tls-client profile for VK auth/captcha (e.g. confirmed_android_2, mesh_android, chrome_146); env VK_TURN_TLS_PROFILE overrides")
+	tcputil.RegisterTuningFlags()
 	flag.Parse()
 	tlsClientProfileName = *tlsProfileFlag
 	if *genWrapKey {
