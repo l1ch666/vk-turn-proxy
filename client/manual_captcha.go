@@ -350,6 +350,42 @@ func newCaptchaProxyTransport(dialer *dnsdialer.Dialer) *http.Transport {
 	return transport
 }
 
+// captchaProxyLogger wraps the manual-captcha proxy transport to dump the
+// request bodies of captchaNotRobot.* calls under -debug. When the user solves
+// the captcha manually in the WebView, this captures the exact, VK-accepted
+// payload (sensor format/values, params, sequence) — the ground truth needed to
+// fix the automatic solver. session_token is redacted (one-time, but sensitive).
+type captchaProxyLogger struct {
+	base http.RoundTripper
+}
+
+func (c captchaProxyLogger) RoundTrip(req *http.Request) (*http.Response, error) {
+	if isDebug && req.Body != nil && strings.Contains(req.URL.Path, "captchaNotRobot") {
+		if body, err := io.ReadAll(req.Body); err == nil {
+			_ = req.Body.Close()
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			dump := redactSessionToken(body)
+			const maxLen = 6000
+			if len(dump) > maxLen {
+				dump = dump[:maxLen] + "...(truncated)"
+			}
+			log.Printf("[Captcha Proxy] real browser %s body: %s", req.URL.Path, dump)
+		}
+	}
+	return c.base.RoundTrip(req)
+}
+
+func redactSessionToken(body []byte) string {
+	parts := strings.Split(string(body), "&")
+	for i, p := range parts {
+		if strings.HasPrefix(p, "session_token=") {
+			parts[i] = "session_token=***"
+		}
+	}
+	return strings.Join(parts, "&")
+}
+
 func startCaptchaServer(srv *http.Server, logPrefix string) error {
 	var listenErrs []string
 	var listening bool
@@ -451,7 +487,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 		return "", fmt.Errorf("invalid redirect URI: %v", err)
 	}
 
-	transport := newCaptchaProxyTransport(dialer)
+	var transport http.RoundTripper = captchaProxyLogger{base: newCaptchaProxyTransport(dialer)}
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,

@@ -466,6 +466,63 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
+// tlsClientProfileName selects the tls-client profile for VK auth/captcha.
+// Override via -tls-profile flag or VK_TURN_TLS_PROFILE env (env wins).
+var tlsClientProfileName string
+
+// defaultTLSProfile is the compile-time default profile. It can be overridden at
+// build time via -ldflags "-X github.com/cacggghp/vk-turn-proxy/client.defaultTLSProfile=mesh_android"
+// to produce per-profile builds without code edits.
+var defaultTLSProfile = "confirmed_android_2"
+
+func selectedTLSProfileName() string {
+	name := strings.ToLower(strings.TrimSpace(os.Getenv("VK_TURN_TLS_PROFILE")))
+	if name == "" {
+		name = strings.ToLower(strings.TrimSpace(tlsClientProfileName))
+	}
+	if name == "" {
+		return strings.ToLower(strings.TrimSpace(defaultTLSProfile))
+	}
+	return name
+}
+
+// selectTLSProfile maps the configured name to a tls-client ClientProfile.
+// Default is an Android (Chromium) fingerprint, matching the Android WebView
+// that VK accepts — desktop Chrome JA3 is the likely BOT discriminator.
+func selectTLSProfile() profiles.ClientProfile {
+	switch selectedTLSProfileName() {
+	case "chrome_146", "chrome146", "chrome":
+		return profiles.Chrome_146
+	case "chrome_133":
+		return profiles.Chrome_133
+	case "confirmed_android", "android":
+		return profiles.ConfirmedAndroid
+	case "confirmed_android_2", "confirmed_android2", "android2":
+		return profiles.ConfirmedAndroid2
+	case "mesh_android":
+		return profiles.MeshAndroid
+	case "mesh_android_2", "mesh_android2":
+		return profiles.MeshAndroid2
+	case "okhttp4_android_13", "okhttp":
+		return profiles.Okhttp4Android13
+	default:
+		return profiles.ConfirmedAndroid2
+	}
+}
+
+// generateCaptchaDebugInfo derives a per-session debug_info value. A real
+// VK-accepted request carries a 64-hex (32-byte) value, and the old static
+// tool-shared constant is now rejected — so emit a fresh 64-hex value per
+// session (matching the captured length/format).
+func generateCaptchaDebugInfo(profile Profile) string {
+	var raw [32]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		sum := sha256.Sum256([]byte(profile.UserAgent + strconv.FormatInt(time.Now().UnixNano(), 10)))
+		return hex.EncodeToString(sum[:])
+	}
+	return hex.EncodeToString(raw[:])
+}
+
 func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, client tlsclient.HttpClient, profile Profile) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		reqURL := captchaAPIBaseURL + method + "?v=5.131"
@@ -475,6 +532,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 		}
 		domain := parsedURL.Hostname()
 
+		dumpCaptchaRequest(streamID, method, postData)
 		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
 		if err != nil {
 			return nil, err
@@ -499,6 +557,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 		if err := json.Unmarshal(body, &resp); err != nil {
 			return nil, err
 		}
+		dumpCaptchaResponse(streamID, method, resp)
 		return resp, nil
 	}
 
@@ -514,7 +573,8 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 	log.Printf("[STREAM %d] [Captcha] Step 2/4: componentDone", streamID)
 	browserFp := generateBrowserFp(profile)
 	deviceJSON := buildCaptchaDeviceJSON(profile)
-	componentDoneData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", browserFp, neturl.QueryEscape(deviceJSON))
+	// Real WebView sends an empty browser_fp at componentDone (populated only at check).
+	componentDoneData := baseParams + fmt.Sprintf("&browser_fp=&device=%s", neturl.QueryEscape(deviceJSON))
 
 	if _, err := vkReq("captchaNotRobot.componentDone", componentDoneData); err != nil {
 		return "", fmt.Errorf("componentDone failed: %w", err)
@@ -523,20 +583,19 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
-	cursorJSON := generateFakeCursor()
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
 
-	// Dynamically generate debug_info to avoid static fingerprint bans
-	debugInfoBytes := md5.Sum([]byte(profile.UserAgent + strconv.FormatInt(time.Now().UnixNano(), 10)))
-	debugInfo := hex.EncodeToString(debugInfoBytes[:])
+	debugInfo := generateCaptchaDebugInfo(profile)
 
-	connectionRtt := "[50,50,50,50,50,50,50,50,50,50]"
-	connectionDownlink := "[9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5]"
+	connectionRtt := captchaConnectionRtt
+	connectionDownlink := captchaConnectionDownlink
 
+	// Captured VK-accepted check sends all motion sensors, cursor and taps empty;
+	// only connectionDownlink is populated. Replicate exactly.
 	checkData := baseParams + fmt.Sprintf(
 		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
 		neturl.QueryEscape("[]"), neturl.QueryEscape("[]"), neturl.QueryEscape("[]"),
-		neturl.QueryEscape(cursorJSON), neturl.QueryEscape("[]"), neturl.QueryEscape(connectionRtt),
+		neturl.QueryEscape("[]"), neturl.QueryEscape("[]"), neturl.QueryEscape(connectionRtt),
 		neturl.QueryEscape(connectionDownlink),
 		browserFp, hash, answer, debugInfo,
 	)
@@ -796,22 +855,28 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 }
 
 func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer, jar tlsclient.CookieJar) (string, string, string, error) {
+	// Present a coherent Android Chrome identity: the captcha that VK accepts is
+	// solved in an Android WebView (Chromium), so a desktop Windows UA + desktop
+	// Chrome TLS fingerprint is an inconsistency the anti-bot can flag. UA,
+	// client hints and TLS profile (below) are all mobile/Android now.
 	profile := Profile{
-		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+		UserAgent:       "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36",
 		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
-		SecChUaMobile:   "?0",
-		SecChUaPlatform: `"Windows"`,
+		SecChUaMobile:   "?1",
+		SecChUaPlatform: `"Android"`,
 	}
 
+	tlsProfile := selectTLSProfile()
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
 		tlsclient.WithTimeoutSeconds(20),
-		tlsclient.WithClientProfile(profiles.Chrome_146),
+		tlsclient.WithClientProfile(tlsProfile),
 		tlsclient.WithCookieJar(jar),
 		tlsclient.WithDialer(getCustomNetDialer()),
 	)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to initialize tls_client: %w", err)
 	}
+	log.Printf("[STREAM %d] [VK Auth] TLS profile: %s", streamID, selectedTLSProfileName())
 
 	name := generateName()
 	escapedName := neturl.QueryEscape(name)
@@ -1807,7 +1872,10 @@ func main() {
 	genWrapKey := flag.Bool("gen-wrap-key", false, "generate a 64-hex WRAP key and exit")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
+	tlsProfileFlag := flag.String("tls-profile", "", "tls-client profile for VK auth/captcha (e.g. confirmed_android_2, mesh_android, chrome_146); env VK_TURN_TLS_PROFILE overrides")
+	tcputil.RegisterTuningFlags()
 	flag.Parse()
+	tlsClientProfileName = *tlsProfileFlag
 	if *genWrapKey {
 		key, keyErr := generateWrapKey()
 		if keyErr != nil {
@@ -2028,6 +2096,40 @@ func (p *sessionPool) pick() *smux.Session {
 	return p.sessions[idx]
 }
 
+// pickLeastLoaded returns the live session currently carrying the fewest smux
+// streams, so a new TCP connection avoids a session whose TURN/DTLS path has
+// stalled (head-of-line) and isn't draining. This is a strict upgrade over the
+// blind round-robin pick(): with a single session it behaves identically, and
+// with N sessions it spreads load by actual occupancy instead of a counter.
+// Round-robin (via the shared counter) breaks ties so equal-load sessions still
+// rotate. Closed sessions are skipped.
+func (p *sessionPool) pickLeastLoaded() *smux.Session {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := len(p.sessions)
+	if n == 0 {
+		return nil
+	}
+	start := int(p.counter.Add(1) % uint64(n))
+	var best *smux.Session
+	bestLoad := int(^uint(0) >> 1) // max int
+	for i := 0; i < n; i++ {
+		s := p.sessions[(start+i)%n]
+		if s.IsClosed() {
+			continue
+		}
+		load := s.NumStreams()
+		if load < bestLoad {
+			bestLoad = load
+			best = s
+			if load == 0 {
+				break // can't do better than an idle session
+			}
+		}
+	}
+	return best
+}
+
 func (p *sessionPool) count() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -2184,7 +2286,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 		log.Panicf("TCP listen: %s", err)
 	}
 	context.AfterFunc(ctx, func() { _ = listener.Close() })
-	log.Printf("VLESS mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
+	log.Printf("VLESS mode: listening on %s (least-loaded across %d sessions)", listenAddr, numSessions)
 
 	var wgConn sync.WaitGroup
 	for {
@@ -2201,7 +2303,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 			continue
 		}
 
-		sess := pool.pick()
+		sess := pool.pickLeastLoaded()
 		if sess == nil || sess.IsClosed() {
 			log.Printf("No active sessions, rejecting connection")
 			_ = tcpConn.Close()

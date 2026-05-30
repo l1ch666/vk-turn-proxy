@@ -26,11 +26,14 @@ import (
 
 const (
 	captchaAPIBaseURL     = "https://api.vk.com/method/"
-	captchaDebugInfo      = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
 	sliderCaptchaType     = "slider"
 	defaultSliderAttempts = 4
 	adFpLength            = 21
 	adFpAlphabet          = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-"
+	// Connection telemetry copied verbatim from a VK-accepted manual solve:
+	// connectionRtt is empty, connectionDownlink is 16x 9.7.
+	captchaConnectionRtt      = "[]"
+	captchaConnectionDownlink = "[9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7,9.7]"
 )
 
 type captchaNotRobotSession struct {
@@ -42,6 +45,7 @@ type captchaNotRobotSession struct {
 	profile      Profile
 	browserFp    string
 	adFp         string
+	debugInfo    string
 }
 
 type captchaSettingsResponse struct {
@@ -91,6 +95,7 @@ func newCaptchaNotRobotSession(
 		profile:      profile,
 		browserFp:    generateBrowserFp(profile),
 		adFp:         generateAdFp(),
+		debugInfo:    generateCaptchaDebugInfo(profile),
 	}
 }
 
@@ -111,6 +116,7 @@ func (s *captchaNotRobotSession) request(method string, values neturl.Values) (m
 	}
 	domain := parsedURL.Hostname()
 
+	dumpCaptchaRequest(s.streamID, method, values.Encode())
 	req, err := fhttp.NewRequestWithContext(s.ctx, "POST", reqURL, strings.NewReader(values.Encode()))
 	if err != nil {
 		return nil, err
@@ -135,7 +141,46 @@ func (s *captchaNotRobotSession) request(method string, values neturl.Values) (m
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
+	dumpCaptchaResponse(s.streamID, method, resp)
 	return resp, nil
+}
+
+// successTokenRedactRe blanks the success_token before a response is logged so
+// diagnostics never leak a usable token.
+var successTokenRedactRe = regexp.MustCompile(`("success_token"\s*:\s*)"[^"]*"`)
+
+// dumpCaptchaResponse logs the raw VK reply (with success_token redacted) under
+// -debug. VK returns the real rejection reason (error_code/error_text/status)
+// here; the solver otherwise collapses everything into "status: ERROR".
+func dumpCaptchaResponse(streamID int, method string, resp map[string]interface{}) {
+	if !isDebug {
+		return
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	dump := successTokenRedactRe.ReplaceAllString(string(data), `$1"***"`)
+	const maxLen = 2048
+	if len(dump) > maxLen {
+		dump = dump[:maxLen] + "...(truncated)"
+	}
+	log.Printf("[STREAM %d] [Captcha] %s raw response: %s", streamID, method, dump)
+}
+
+// dumpCaptchaRequest logs the outgoing captcha request body (session_token
+// redacted) under -debug, so the auto-solver payload can be diffed against a
+// real VK-accepted browser request.
+func dumpCaptchaRequest(streamID int, method string, body string) {
+	if !isDebug {
+		return
+	}
+	dump := redactSessionToken([]byte(body))
+	const maxLen = 6000
+	if len(dump) > maxLen {
+		dump = dump[:maxLen] + "...(truncated)"
+	}
+	log.Printf("[STREAM %d] [Captcha] %s request body: %s", streamID, method, dump)
 }
 
 func applyCaptchaAPIHeaders(req *fhttp.Request, profile Profile) {
@@ -182,7 +227,9 @@ func (s *captchaNotRobotSession) requestSettings() (*captchaSettingsResponse, er
 
 func (s *captchaNotRobotSession) requestComponentDone() error {
 	values := s.baseValues()
-	values.Set("browser_fp", s.browserFp)
+	// Real WebView sends an empty browser_fp at componentDone (it is only
+	// populated later at check). Matching that captured behavior.
+	values.Set("browser_fp", "")
 	values.Set("device", buildCaptchaDeviceJSON(s.profile))
 
 	resp, err := s.request("captchaNotRobot.componentDone", values)
@@ -201,7 +248,8 @@ func (s *captchaNotRobotSession) requestComponentDone() error {
 }
 
 func (s *captchaNotRobotSession) requestCheckboxCheck() (*captchaCheckResult, error) {
-	return s.requestCheck(generateSliderCursor(0, 1), base64.StdEncoding.EncodeToString([]byte("{}")))
+	// Captured VK-accepted invisible check sends cursor=[] and answer={}.
+	return s.requestCheck("[]", base64.StdEncoding.EncodeToString([]byte("{}")))
 }
 
 func (s *captchaNotRobotSession) requestSliderContent(sliderSettings string) (*sliderCaptchaContent, error) {
@@ -228,17 +276,18 @@ func (s *captchaNotRobotSession) requestSliderCheck(activeSteps []int, candidate
 
 func (s *captchaNotRobotSession) requestCheck(cursor string, answer string) (*captchaCheckResult, error) {
 	values := s.baseValues()
+	// Captured VK-accepted check sends all motion sensors and taps empty.
 	values.Set("accelerometer", "[]")
 	values.Set("gyroscope", "[]")
 	values.Set("motion", "[]")
 	values.Set("cursor", cursor)
 	values.Set("taps", "[]")
-	values.Set("connectionRtt", "[]")
-	values.Set("connectionDownlink", "[]")
+	values.Set("connectionRtt", captchaConnectionRtt)
+	values.Set("connectionDownlink", captchaConnectionDownlink)
 	values.Set("browser_fp", s.browserFp)
 	values.Set("hash", s.hash)
 	values.Set("answer", answer)
-	values.Set("debug_info", captchaDebugInfo)
+	values.Set("debug_info", s.debugInfo)
 
 	resp, err := s.request("captchaNotRobot.check", values)
 	if err != nil {
@@ -281,49 +330,33 @@ func callCaptchaNotRobotWithSliderPOC(
 
 	time.Sleep(200 * time.Millisecond)
 
-	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
-	initialCheck, err := session.requestCheckboxCheck()
-	if err != nil {
-		return "", err
-	}
-	if initialCheck.Status == "OK" {
-		if initialCheck.SuccessToken == "" {
-			return "", fmt.Errorf("success_token not found")
-		}
-		session.requestEndSession()
-		return initialCheck.SuccessToken, nil
-	}
-
 	sliderSettings, hasSlider := settingsResp.SettingsByType[sliderCaptchaType]
 	log.Printf(
-		"[STREAM %d] [Captcha] Checkbox-style check returned status=%s (settings show_type=%q, check show_type=%q, available_types=%s)",
+		"[STREAM %d] [Captcha] Available captcha types: %s (settings show_type=%q, slider settings present=%t)",
 		streamID,
-		initialCheck.Status,
-		settingsResp.ShowCaptchaType,
-		initialCheck.ShowCaptchaType,
 		describeCaptchaTypes(settingsResp.SettingsByType),
+		settingsResp.ShowCaptchaType,
+		hasSlider,
 	)
 
-	if !hasSlider {
-		log.Printf(
-			"[STREAM %d] [Captcha] Slider settings not found in settings response. Trying getContent without captcha_settings...",
-			streamID,
-		)
-	} else {
-		log.Printf("[STREAM %d] [Captcha] Trying experimental slider solver...", streamID)
-	}
-
+	// Fetch the slider puzzle BEFORE submitting any check. Submitting a throwaway
+	// checkbox check first gets the session flagged status=BOT, after which
+	// getContent returns ERROR and further checks hit ERROR_LIMIT (confirmed in
+	// device logs). A real browser fetches the puzzle, then submits one answer.
+	log.Printf("[STREAM %d] [Captcha] Step 3/4: getContent", streamID)
 	sliderContent, err := session.requestSliderContent(sliderSettings)
 	if err != nil {
 		log.Printf(
-			"[STREAM %d] [Captcha] Slider getContent failed (status: %v). Trying to solve as a checkbox instead...",
+			"[STREAM %d] [Captcha] Slider getContent failed (%v). Falling back to a single invisible checkbox check...",
 			streamID,
 			err,
 		)
-		// Fallback: maybe it's just a checkbox that needs a human-like check
 		time.Sleep(300 * time.Millisecond)
-		finalCheck, err2 := session.requestCheckboxCheck()
-		if err2 == nil && finalCheck.Status == "OK" {
+		finalCheck, checkErr := session.requestCheckboxCheck()
+		if checkErr != nil {
+			return "", fmt.Errorf("getContent failed (%w); checkbox check error: %v", err, checkErr)
+		}
+		if finalCheck.Status == "OK" {
 			if finalCheck.SuccessToken == "" {
 				return "", fmt.Errorf("success_token not found in fallback check")
 			}
@@ -331,7 +364,7 @@ func callCaptchaNotRobotWithSliderPOC(
 			session.requestEndSession()
 			return finalCheck.SuccessToken, nil
 		}
-		return "", fmt.Errorf("check status: %s (slider getContent failed: %w)", initialCheck.Status, err)
+		return "", fmt.Errorf("getContent failed (%w); checkbox status: %s", err, finalCheck.Status)
 	}
 
 	candidates, err := rankSliderCandidates(sliderContent.Image, sliderContent.Size, sliderContent.Steps)
@@ -365,10 +398,12 @@ func callCaptchaNotRobotWithSliderPOC(
 }
 
 func buildCaptchaDeviceJSON(profile Profile) string {
-	return fmt.Sprintf(
-		`{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1040,"innerWidth":1920,"innerHeight":969,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`,
-		profile.UserAgent,
-	)
+	_ = profile
+	// Mirror the exact device descriptor a real Android WebView sends (captured
+	// from a VK-accepted manual solve): mobile dimensions, no userAgent/platform
+	// fields. Sending a desktop descriptor (1920x1080, Win32) is an inconsistency
+	// the anti-bot can flag.
+	return `{"screenWidth":360,"screenHeight":825,"screenAvailWidth":360,"screenAvailHeight":825,"innerWidth":360,"innerHeight":679,"devicePixelRatio":2,"language":"en-US","languages":["en-US","ru-RU"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":2,"connectionEffectiveType":"4g","notificationsPermission":"denied"}`
 }
 
 func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettingsResponse, error) {

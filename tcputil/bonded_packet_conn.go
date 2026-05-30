@@ -107,6 +107,9 @@ func (b *BondedPacketConn) RemoteAddr() net.Addr {
 func (b *BondedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	select {
 	case pkt := <-b.readCh:
+		// Datagram semantics: one packet per call. KCP always passes a buffer >=
+		// its MTU and readLoop drops oversized packets, so copy never truncates a
+		// valid KCP packet here.
 		n := copy(p, pkt.data)
 		return n, pkt.addr, nil
 	case <-b.closed:
@@ -189,6 +192,9 @@ func (b *BondedPacketConn) snapshotPaths() []*bondedPath {
 func (b *BondedPacketConn) readLoop(path *bondedPath) {
 	defer b.removePath(path, true)
 
+	// Read whole DTLS records (datagram framing): one Read returns exactly one
+	// KCP packet. The buffer is large so a record is never split, but legitimate
+	// KCP packets are <= KCPMtu.
 	buf := make([]byte, 64*1024)
 	for {
 		n, err := path.conn.Read(buf)
@@ -196,6 +202,13 @@ func (b *BondedPacketConn) readLoop(path *bondedPath) {
 			return
 		}
 		if n == 0 {
+			continue
+		}
+		// Drop packets larger than the configured KCP MTU (+ header headroom):
+		// delivering them would be truncated by KCP's read buffer downstream and
+		// corrupt the stream. KCP recovers a dropped packet via retransmission,
+		// so dropping is strictly safer than silently truncating.
+		if n > KCPMtu+128 {
 			continue
 		}
 		data := make([]byte, n)
@@ -258,6 +271,10 @@ func WriteBondHello(conn net.Conn, bondID string) error {
 	return err
 }
 
+// ReadBondHello reads the bond hello line. It relies on DTLS datagram framing:
+// the peer sends the hello via a single WriteBondHello (its own DTLS record), so
+// the first read returns exactly the hello line and no subsequent KCP data is
+// consumed/lost. Do NOT coalesce the hello with other writes on the client side.
 func ReadBondHello(conn net.Conn) (string, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return "", err
