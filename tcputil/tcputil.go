@@ -137,6 +137,27 @@ func (d *DtlsPacketConn) SetWriteDeadline(t time.Time) error {
 // NewKCPOverPacketConn creates a KCP session over a packet transport.
 // isServer: true for server-side (listener), false for client-side (dialer).
 func NewKCPOverPacketConn(pc net.PacketConn, remote net.Addr, isServer bool) (*kcp.UDPSession, error) {
+	return newKCPOverPacketConn(pc, remote, isServer, KCPWindow)
+}
+
+// NewKCPOverPacketConnBonded creates a KCP session whose window is scaled for a
+// bonded transport carrying pathCount parallel TURN/DTLS paths. A bond aggregates
+// the bandwidth-delay product of all paths into ONE KCP pipe, so a single-path
+// window would cap the combined throughput. The window scales with pathCount,
+// bounded to avoid pathological memory use.
+func NewKCPOverPacketConnBonded(pc net.PacketConn, remote net.Addr, isServer bool, pathCount int) (*kcp.UDPSession, error) {
+	if pathCount < 1 {
+		pathCount = 1
+	}
+	wnd := KCPWindow * pathCount
+	const maxWnd = 8192 // cap: ~8192*1200B ≈ 9.4MB of in-flight per direction
+	if wnd > maxWnd {
+		wnd = maxWnd
+	}
+	return newKCPOverPacketConn(pc, remote, isServer, wnd)
+}
+
+func newKCPOverPacketConn(pc net.PacketConn, remote net.Addr, isServer bool, window int) (*kcp.UDPSession, error) {
 	block, err := kcp.NewNoneBlockCrypt(nil) // DTLS already encrypts
 	if err != nil {
 		return nil, err
@@ -173,7 +194,7 @@ func NewKCPOverPacketConn(pc net.PacketConn, remote net.Addr, isServer bool) (*k
 	// - NoDelay mode for lower latency
 	// - Window sizes suitable for ~5Mbit/s
 	sess.SetNoDelay(KCPNoDelay, KCPInterval, KCPResend, KCPNC)
-	sess.SetWindowSize(KCPWindow, KCPWindow)
+	sess.SetWindowSize(window, window)
 	sess.SetMtu(KCPMtu) // must fit inside DTLS+TURN; keep <= inner tunnel MTU
 	sess.SetACKNoDelay(true)
 

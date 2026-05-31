@@ -2367,7 +2367,7 @@ func runVLESSBondMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, li
 		}
 	}
 
-	kcpSess, err := tcputil.NewKCPOverPacketConn(bonded, bonded.RemoteAddr(), false)
+	kcpSess, err := tcputil.NewKCPOverPacketConnBonded(bonded, bonded.RemoteAddr(), false, numSessions)
 	if err != nil {
 		_ = bonded.Close()
 		wgMaint.Wait()
