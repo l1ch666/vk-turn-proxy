@@ -31,6 +31,7 @@ func main() {
 	genWrapKey := flag.Bool("gen-wrap-key", false, "generate a 64-hex WRAP key and exit")
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
+	log.Printf("tuning: %s", tcputil.TuningSummary())
 	if *genWrapKey {
 		key, keyErr := generateWrapKey()
 		if keyErr != nil {

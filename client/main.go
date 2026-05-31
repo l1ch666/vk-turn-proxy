@@ -1876,6 +1876,7 @@ func main() {
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
 	tlsClientProfileName = *tlsProfileFlag
+	log.Printf("tuning: %s", tcputil.TuningSummary())
 	if *genWrapKey {
 		key, keyErr := generateWrapKey()
 		if keyErr != nil {
