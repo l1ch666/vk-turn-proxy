@@ -31,6 +31,7 @@ func main() {
 	genWrapKey := flag.Bool("gen-wrap-key", false, "generate a 64-hex WRAP key and exit")
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
+	log.Printf("tuning: %s", tcputil.TuningSummary())
 	if *genWrapKey {
 		key, keyErr := generateWrapKey()
 		if keyErr != nil {
@@ -265,7 +266,14 @@ func (g *vlessBondGroup) run(ctx context.Context, onDone func()) {
 	defer onDone()
 	defer func() { _ = g.pc.Close() }()
 
-	kcpSess, err := tcputil.NewKCPOverPacketConn(g.pc, g.pc.RemoteAddr(), true)
+	// Scale the receive/send window for the aggregate of bonded paths. Window
+	// sizes need not match the peer exactly (unlike FEC), so we size from the
+	// paths connected so far (with a floor) — more paths may still join after.
+	pathCount := g.pc.Count()
+	if pathCount < 1 {
+		pathCount = 1
+	}
+	kcpSess, err := tcputil.NewKCPOverPacketConnBonded(g.pc, g.pc.RemoteAddr(), true, pathCount)
 	if err != nil {
 		log.Printf("VLESS bond %s: KCP session error: %s", g.shortID(), err)
 		return

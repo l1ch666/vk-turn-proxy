@@ -39,6 +39,42 @@ you set something.
 | (env only) | `VK_TURN_KCP_NODELAY` | 1 | KCP nodelay (0/1). |
 | (env only) | `VK_TURN_KCP_RESEND` | 2 | KCP fast‑retransmit dup‑ACK threshold. |
 | (env only) | `VK_TURN_KCP_NC` | 1 | KCP no‑congestion (0/1). |
+| `-kcp-fec` | `VK_TURN_KCP_FEC` | off | Reed‑Solomon FEC `data:parity` (e.g. `10:3`). **MUST match client and server.** |
+
+## Why single‑stream VLESS is slow — and what actually helps
+
+The symptom (a single big download / speed test capping at ~200–500 KB/s) comes
+from three compounding facts, not from a tunable being wrong:
+
+1. **VK caps ~5 Mbit/s per TURN stream.** Aggregate speed only comes from running
+   several TURN streams in parallel (`-n`).
+2. **One TCP connection is pinned to one stream.** Many connections (normal
+   browsing) spread across the `-n` paths and approach `n × 5 Mbit`. But a *single*
+   flow uses *one* path and is capped at one path's rate. The other paths sit idle.
+3. **TCP‑over‑TCP.** VLESS carries your TCP traffic over KCP/DTLS/**TCP**‑TURN. At
+   TURN's high RTT, with any loss, the inner and outer retransmit timers fight and
+   throughput collapses *below* the cap. (WireGuard mode avoids this — its payload
+   is UDP.)
+
+What actually moves the needle, in order:
+
+- **KCP FEC (`-kcp-fec 10:3` / `VK_TURN_KCP_FEC`).** Recovers lost packets without
+  a retransmit round‑trip — the biggest single win against (3). Must be set on
+  **both** ends; the Android app does this when "KCP FEC" is enabled. *(Before
+  this fix the toggle was a no‑op — the core never read the env.)*
+- **`-vless-bond`.** The only mechanism that lets a *single* flow exceed one
+  path's cap, by striping one KCP pipe across N TURN paths (attacks (2)). Its
+  bonded KCP window now scales with path count. Still experimental: it couples
+  head‑of‑line across paths, so measure vs non‑bond.
+- **UDP‑TURN (`-udp` with `-vless`).** Removes the outer TCP layer → no
+  TCP‑over‑TCP. Big win **where UDP to TURN isn't blocked** by the carrier; keep
+  TCP as the fallback.
+- **`-n`** higher (more parallel paths) helps aggregate (multi‑connection) speed.
+- **`-kcp-window`** larger to fill a high‑RTT pipe (see BDP below).
+
+> Quick start for a slow single stream: enable **KCP FEC** first; if your carrier
+> allows UDP, also try **`-udp`**; for single‑flow speed tests specifically, try
+> **`-vless-bond`** and compare. Change one at a time and measure.
 | `-n` | — | 10 (VK) / 1 (Yandex) | Parallel TURN streams. Main throughput multiplier. |
 | `-streams-per-cred` | — | 10 | Streams sharing one credential cache (fewer captcha/auth round‑trips). |
 
