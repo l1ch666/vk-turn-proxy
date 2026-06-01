@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -138,16 +139,66 @@ func (b *BondedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		if err == nil && n == len(p) {
 			return n, nil
 		}
+
+		// CRITICAL: only remove a path on a PERMANENT failure (the connection is
+		// closed/broken). A transient write error — e.g. a write-deadline timeout
+		// (pion DTLS returns errDeadlineExceeded) or momentary relay backpressure —
+		// must NOT tear the path down: doing so made bond decay to a single path
+		// under normal loss, collapsing throughput to one stream (~5 Mbit) and
+		// causing reconnect churn. On a transient error we keep the path and just
+		// try the next one for THIS packet; KCP retransmits anything truly lost.
 		if err == nil {
 			err = ioShortWrite(n, len(p))
 		}
 		lastErr = err
-		b.removePath(path, true)
+		if isPermanentPathError(err) {
+			b.removePath(path, true)
+		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("vless bond has no writable paths")
 	}
+	// Report the packet as "sent" for a transient miss: KCP owns reliability and
+	// will retransmit. Returning an error here would propagate up and can abort the
+	// KCP session on what is only a momentary, recoverable condition.
+	if !isPermanentPathError(lastErr) {
+		return len(p), nil
+	}
 	return 0, lastErr
+}
+
+// isPermanentPathError reports whether a path write error means the underlying
+// connection is dead (so the path should be removed) rather than a transient,
+// recoverable condition (timeout/backpressure/short write) that KCP can ride out.
+func isPermanentPathError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, io.EOF) {
+		return true
+	}
+	// Timeouts are explicitly transient.
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "deadline exceeded"),
+		strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "temporarily"),
+		strings.Contains(msg, "short write"),
+		strings.Contains(msg, "buffer"):
+		return false
+	case strings.Contains(msg, "closed"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "reset"),
+		strings.Contains(msg, "use of closed"):
+		return true
+	}
+	// Unknown errors: treat as transient (keep the path). A genuinely dead path
+	// will surface a closed/EOF on its readLoop and be removed there anyway.
+	return false
 }
 
 func (b *BondedPacketConn) Close() error {
