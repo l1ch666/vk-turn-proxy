@@ -467,13 +467,7 @@ func notifyKey(keyCh chan<- string, key string) {
 	}
 }
 
-// solveCaptchaViaHTTP keeps the original helper contract for callers that do
-// not manage a lifecycle. Runtime code should use solveCaptchaViaHTTPContext.
-func solveCaptchaViaHTTP(captchaImg string) (string, error) {
-	return solveCaptchaViaHTTPContext(context.Background(), captchaImg)
-}
-
-func solveCaptchaViaHTTPContext(ctx context.Context, captchaImg string) (string, error) {
+func solveCaptchaViaHTTP(ctx context.Context, captchaImg string) (string, error) {
 	keyCh := make(chan string, 1)
 	mux := http.NewServeMux()
 
@@ -504,13 +498,7 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 	return runCaptchaServerAndWait(ctx, mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error")
 }
 
-// solveCaptchaViaProxy keeps the original helper contract for callers that do
-// not manage a lifecycle. Runtime code should use solveCaptchaViaProxyContext.
-func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
-	return solveCaptchaViaProxyContext(context.Background(), redirectURI, dialer)
-}
-
-func solveCaptchaViaProxyContext(ctx context.Context, redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
+func solveCaptchaViaProxy(ctx context.Context, redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
 	keyCh := make(chan string, 1)
 
 	targetURL, err := neturl.Parse(redirectURI)
