@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/url"
 	"testing"
 )
@@ -61,5 +63,28 @@ func TestRewriteProxyRedirectLocation(t *testing.T) {
 				t.Fatalf("rewriteProxyRedirectLocation() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestWaitForCaptchaResultReturnsKey(t *testing.T) {
+	keyCh := make(chan string, 1)
+	keyCh <- "solved"
+
+	got, err := waitForCaptchaResult(context.Background(), keyCh)
+	if err != nil {
+		t.Fatalf("waitForCaptchaResult returned error: %v", err)
+	}
+	if got != "solved" {
+		t.Fatalf("waitForCaptchaResult = %q, want %q", got, "solved")
+	}
+}
+
+func TestWaitForCaptchaResultStopsOnContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := waitForCaptchaResult(ctx, make(chan string))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForCaptchaResult error = %v, want context.Canceled", err)
 	}
 }
