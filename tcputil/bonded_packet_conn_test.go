@@ -11,12 +11,12 @@ func TestBondedPacketConnWritesAcrossPaths(t *testing.T) {
 	t.Parallel()
 
 	pc := NewBondedPacketConn("test")
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	left1, right1 := net.Pipe()
-	defer right1.Close()
+	defer func() { _ = right1.Close() }()
 	left2, right2 := net.Pipe()
-	defer right2.Close()
+	defer func() { _ = right2.Close() }()
 
 	pc.AddConn(left1, nil)
 	pc.AddConn(left2, nil)
@@ -52,10 +52,10 @@ func TestBondedPacketConnReadsFromAnyPath(t *testing.T) {
 	t.Parallel()
 
 	pc := NewBondedPacketConn("test")
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	left, right := net.Pipe()
-	defer right.Close()
+	defer func() { _ = right.Close() }()
 	pc.AddConn(left, nil)
 
 	go func() {
@@ -76,8 +76,8 @@ func TestBondHelloRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	left, right := net.Pipe()
-	defer left.Close()
-	defer right.Close()
+	defer func() { _ = left.Close() }()
+	defer func() { _ = right.Close() }()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -100,9 +100,9 @@ func TestBondedPacketConnCarriesKCP(t *testing.T) {
 	t.Parallel()
 
 	clientPC := NewBondedPacketConn("client")
-	defer clientPC.Close()
+	defer func() { _ = clientPC.Close() }()
 	serverPC := NewBondedPacketConn("server")
-	defer serverPC.Close()
+	defer func() { _ = serverPC.Close() }()
 
 	clientPath1, serverPath1 := net.Pipe()
 	clientPath2, serverPath2 := net.Pipe()
@@ -118,7 +118,7 @@ func TestBondedPacketConnCarriesKCP(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		defer serverSess.Close()
+		defer func() { _ = serverSess.Close() }()
 		_ = serverSess.SetDeadline(time.Now().Add(3 * time.Second))
 
 		buf := make([]byte, 32)
@@ -139,7 +139,7 @@ func TestBondedPacketConnCarriesKCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client KCP failed: %v", err)
 	}
-	defer clientSess.Close()
+	defer func() { _ = clientSess.Close() }()
 	_ = clientSess.SetDeadline(time.Now().Add(3 * time.Second))
 
 	if _, err := clientSess.Write([]byte("ping")); err != nil {
