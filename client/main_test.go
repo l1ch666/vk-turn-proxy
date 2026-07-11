@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+)
 
 func TestCaptchaSolveModeForAttempt(t *testing.T) {
 	t.Parallel()
@@ -132,5 +136,58 @@ func TestParseVkCaptchaErrorAllowsMissingMessage(t *testing.T) {
 	}
 	if captchaErr.ErrorMsg != "" {
 		t.Fatalf("expected empty error message, got %q", captchaErr.ErrorMsg)
+	}
+}
+
+func TestIsAuthErrorIsCaseInsensitive(t *testing.T) {
+	for _, err := range []error{
+		errors.New("401 Unauthorized"),
+		errors.New("authentication failed"),
+		errors.New("INVALID CREDENTIAL"),
+		errors.New("Stale Nonce"),
+	} {
+		if !isAuthError(err) {
+			t.Fatalf("isAuthError(%q) = false, want true", err)
+		}
+	}
+}
+
+func TestRecordTURNAllocationResultInvalidatesCachedCredentials(t *testing.T) {
+	const streamID = 900000
+	cacheID := getCacheID(streamID)
+	defer func() {
+		credentialsStore.mu.Lock()
+		delete(credentialsStore.caches, cacheID)
+		credentialsStore.mu.Unlock()
+	}()
+
+	cache := getStreamCache(streamID)
+	cache.mutex.Lock()
+	cache.creds = TurnCredentials{
+		Username:  "user",
+		Password:  "password",
+		ExpiresAt: time.Now().Add(time.Hour),
+		Link:      "link",
+	}
+	cache.mutex.Unlock()
+
+	authErr := errors.New("401 unauthorized")
+	for i := 0; i < maxCacheErrors; i++ {
+		recordTURNAllocationResult(streamID, authErr)
+	}
+
+	cache.mutex.RLock()
+	defer cache.mutex.RUnlock()
+	if cache.creds.Username != "" || cache.creds.Password != "" {
+		t.Fatalf("cached credentials were not invalidated: %+v", cache.creds)
+	}
+}
+
+func TestIsFatalCaptchaError(t *testing.T) {
+	if !isFatalCaptchaError(errors.New("get TURN creds: FATAL_CAPTCHA_FAILED_NO_STREAMS")) {
+		t.Fatal("expected fatal captcha error to be recognized")
+	}
+	if isFatalCaptchaError(errors.New("temporary setup failure")) {
+		t.Fatal("temporary error was classified as fatal")
 	}
 }
