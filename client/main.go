@@ -234,20 +234,6 @@ func generateBrowserFp(profile Profile) string {
 	return hex.EncodeToString(h[:])
 }
 
-func generateFakeCursor() string {
-	startX := 600 + rand.Intn(400)
-	startY := 300 + rand.Intn(200)
-	startTime := time.Now().UnixMilli() - int64(rand.Intn(2000)+1000)
-	var points []string
-	for i := 0; i < 15+rand.Intn(10); i++ {
-		startX += rand.Intn(15) - 5
-		startY += rand.Intn(15) + 2
-		startTime += int64(rand.Intn(40) + 10)
-		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, startX, startY, startTime))
-	}
-	return "[" + strings.Join(points, ",") + "]"
-}
-
 func getCustomNetDialer() net.Dialer {
 	return net.Dialer{
 		Timeout:   20 * time.Second,
@@ -1028,9 +1014,9 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					log.Printf("[STREAM %d] [Captcha] Triggering manual captcha fallback...", streamID)
 					manualCtx, manualCancel := context.WithTimeout(ctx, 60*time.Second)
 					if captchaErr.RedirectURI != "" {
-						successToken, solveErr = solveCaptchaViaProxyContext(manualCtx, captchaErr.RedirectURI, dialer)
+						successToken, solveErr = solveCaptchaViaProxy(manualCtx, captchaErr.RedirectURI, dialer)
 					} else if captchaErr.CaptchaImg != "" {
-						captchaKey, solveErr = solveCaptchaViaHTTPContext(manualCtx, captchaErr.CaptchaImg)
+						captchaKey, solveErr = solveCaptchaViaHTTP(manualCtx, captchaErr.CaptchaImg)
 					} else {
 						solveErr = fmt.Errorf("no redirect_uri or captcha_img")
 					}
@@ -2079,22 +2065,11 @@ func (p *sessionPool) remove(s *smux.Session) {
 	p.mu.Unlock()
 }
 
-func (p *sessionPool) pick() *smux.Session {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	n := len(p.sessions)
-	if n == 0 {
-		return nil
-	}
-	idx := p.counter.Add(1) % uint64(n)
-	return p.sessions[idx]
-}
-
 // pickLeastLoaded returns the live session currently carrying the fewest smux
 // streams, so a new TCP connection avoids a session whose TURN/DTLS path has
-// stalled (head-of-line) and isn't draining. This is a strict upgrade over the
-// blind round-robin pick(): with a single session it behaves identically, and
-// with N sessions it spreads load by actual occupancy instead of a counter.
+// stalled (head-of-line) and isn't draining. With a single session it behaves
+// identically to round-robin selection; with N sessions it spreads load by
+// actual occupancy instead of a counter.
 // Round-robin (via the shared counter) breaks ties so equal-load sessions still
 // rotate. Closed sessions are skipped.
 func (p *sessionPool) pickLeastLoaded() *smux.Session {
