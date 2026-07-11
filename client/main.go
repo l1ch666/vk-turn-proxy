@@ -714,12 +714,29 @@ func isAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
+	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "401") ||
-		strings.Contains(errStr, "Unauthorized") ||
+		strings.Contains(errStr, "unauthorized") ||
 		strings.Contains(errStr, "authentication") ||
 		strings.Contains(errStr, "invalid credential") ||
 		strings.Contains(errStr, "stale nonce")
+}
+
+func isFatalCaptchaError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "FATAL_CAPTCHA")
+}
+
+func recordTURNAllocationResult(streamID int, err error) {
+	if err != nil {
+		if isAuthError(err) {
+			handleAuthError(streamID)
+		}
+		return
+	}
+
+	cache := getStreamCache(streamID)
+	cache.errorCount.Store(0)
+	cache.lastErrorTime.Store(0)
 }
 
 func handleAuthError(streamID int) bool {
@@ -842,7 +859,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 		log.Printf("[STREAM %d] [VK Auth] Failed with client_id=%s: %v", streamID, creds.ClientID, err)
 
 		// Hard abort on captcha/fatal conditions instead of trying next creds
-		if strings.Contains(err.Error(), "CAPTCHA_WAIT_REQUIRED") || strings.Contains(err.Error(), "FATAL_CAPTCHA") {
+		if strings.Contains(err.Error(), "CAPTCHA_WAIT_REQUIRED") || isFatalCaptchaError(err) {
 			return "", "", "", err
 		}
 
@@ -1010,33 +1027,14 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 				case captchaSolveModeManual:
 					log.Printf("[STREAM %d] [Captcha] Triggering manual captcha fallback...", streamID)
 					manualCtx, manualCancel := context.WithTimeout(ctx, 60*time.Second)
-
-					type manualRes struct {
-						token string
-						key   string
-						err   error
+					if captchaErr.RedirectURI != "" {
+						successToken, solveErr = solveCaptchaViaProxyContext(manualCtx, captchaErr.RedirectURI, dialer)
+					} else if captchaErr.CaptchaImg != "" {
+						captchaKey, solveErr = solveCaptchaViaHTTPContext(manualCtx, captchaErr.CaptchaImg)
+					} else {
+						solveErr = fmt.Errorf("no redirect_uri or captcha_img")
 					}
-					resCh := make(chan manualRes, 1)
-
-					go func() {
-						var t, k string
-						var e error
-						if captchaErr.RedirectURI != "" {
-							t, e = solveCaptchaViaProxy(captchaErr.RedirectURI, dialer)
-						} else if captchaErr.CaptchaImg != "" {
-							k, e = solveCaptchaViaHTTP(captchaErr.CaptchaImg)
-						} else {
-							e = fmt.Errorf("no redirect_uri or captcha_img")
-						}
-						resCh <- manualRes{t, k, e}
-					}()
-
-					select {
-					case res := <-resCh:
-						successToken = res.token
-						captchaKey = res.key
-						solveErr = res.err
-					case <-manualCtx.Done():
+					if manualCtx.Err() == context.DeadlineExceeded {
 						solveErr = fmt.Errorf("manual captcha timed out after 60s")
 					}
 					manualCancel()
@@ -1677,16 +1675,11 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 
 	relayConn, err1 := client.Allocate()
+	recordTURNAllocationResult(streamID, err1)
 	if err1 != nil {
-		if isAuthError(err1) {
-			handleAuthError(streamID)
-		}
 		err = fmt.Errorf("failed to allocate: %s", err1)
 		return
 	}
-
-	// Reset error count on successful allocation
-	getStreamCache(streamID).errorCount.Store(0)
 
 	// Safely track active streams globally
 	connectedStreams.Add(1)
@@ -1800,7 +1793,7 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 			go oneTurnConnection(ctx, turnParams, peer, conn2, streamID, c)
 
 			if err := <-c; err != nil {
-				if strings.Contains(err.Error(), "FATAL_CAPTCHA") {
+				if isFatalCaptchaError(err) {
 					log.Printf("[STREAM %d] Fatal manual captcha error. Shutting down application.", streamID)
 					if globalAppCancel != nil {
 						globalAppCancel()
@@ -2032,12 +2025,12 @@ func main() {
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, connchan, okchan, 1)
+		oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, connchan, okchan, 0)
 	}()
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneTurnConnectionLoop(ctx, params, peer, connchan, t, 1)
+		oneTurnConnectionLoop(ctx, params, peer, connchan, t, 0)
 	}()
 
 	select {
@@ -2447,6 +2440,13 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 
 		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer, id)
 		if err != nil {
+			if isFatalCaptchaError(err) {
+				log.Printf("[session %d] fatal captcha error; shutting down application", id)
+				if globalAppCancel != nil {
+					globalAppCancel()
+				}
+				return
+			}
 			log.Printf("[session %d] setup error: %s, retrying...", id, err)
 			select {
 			case <-ctx.Done():
@@ -2491,6 +2491,13 @@ func maintainVLESSBondPath(ctx context.Context, tp *turnParams, peer *net.UDPAdd
 
 		dtlsConn, cleanup, err := createDTLSConnection(ctx, tp, peer, id)
 		if err != nil {
+			if isFatalCaptchaError(err) {
+				log.Printf("[bond path %d] fatal captcha error; shutting down application", id)
+				if globalAppCancel != nil {
+					globalAppCancel()
+				}
+				return
+			}
 			log.Printf("[bond path %d] setup error: %s, retrying...", id, err)
 			select {
 			case <-ctx.Done():
@@ -2649,6 +2656,7 @@ func createDTLSConnection(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 		return nil, nil, fmt.Errorf("TURN listen: %w", err)
 	}
 	relayConn, err := turnClient.Allocate()
+	recordTURNAllocationResult(id, err)
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("TURN allocate: %w", err)
