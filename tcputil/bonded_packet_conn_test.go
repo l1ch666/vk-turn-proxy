@@ -176,8 +176,14 @@ type scriptedConn struct {
 	closed     bool
 }
 
-func (c *scriptedConn) Read(b []byte) (int, error)         { return 0, io.EOF }
-func (c *scriptedConn) Write(b []byte) (int, error)        { c.writeCalls++; if c.writeErr != nil { return 0, c.writeErr }; return len(b), nil }
+func (c *scriptedConn) Read(b []byte) (int, error) { return 0, io.EOF }
+func (c *scriptedConn) Write(b []byte) (int, error) {
+	c.writeCalls++
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	return len(b), nil
+}
 func (c *scriptedConn) Close() error                       { c.closed = true; return nil }
 func (c *scriptedConn) LocalAddr() net.Addr                { return bondAddr("local") }
 func (c *scriptedConn) RemoteAddr() net.Addr               { return bondAddr("remote") }
@@ -206,9 +212,11 @@ func TestIsPermanentPathError(t *testing.T) {
 	}
 }
 
-func errDeadlineLike() error  { return timeoutErr{} }
-func shortWriteLike() error   { return ioShortWrite(1, 10) }
-func useOfClosedLike() error  { return &net.OpError{Op: "write", Err: errStr("use of closed network connection")} }
+func errDeadlineLike() error { return timeoutErr{} }
+func shortWriteLike() error  { return ioShortWrite(1, 10) }
+func useOfClosedLike() error {
+	return &net.OpError{Op: "write", Err: errStr("use of closed network connection")}
+}
 
 type errStr string
 
