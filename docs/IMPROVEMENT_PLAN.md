@@ -14,12 +14,12 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 
 ## Phase 1: correctness and lifecycle
 
-- [ ] Make manual captcha waiting context-aware and always release loopback listeners.
-- [ ] Apply TURN authentication-cache invalidation consistently in UDP and VLESS modes.
-- [ ] Treat fatal captcha errors consistently in all connection maintainers.
-- [ ] Use unique zero-based stream IDs in the plain UDP dispatcher.
-- [ ] Prevent stale TURN readers from consuming packets after reconnect.
-- [ ] Close DTLS and packet-pipe resources after failed handshakes.
+- [x] Make manual captcha waiting context-aware and always release loopback listeners.
+- [x] Apply TURN authentication-cache invalidation consistently in UDP and VLESS modes.
+- [x] Treat fatal captcha errors consistently in all connection maintainers.
+- [x] Use unique zero-based stream IDs in the plain UDP dispatcher.
+- [x] Prevent stale TURN readers from consuming packets after reconnect.
+- [x] Close DTLS and packet-pipe resources after failed handshakes.
 - [ ] Preserve TCP half-close semantics and make VLESS shutdown bounded.
 
 ## Phase 2: bond correctness

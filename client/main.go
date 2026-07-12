@@ -1461,6 +1461,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 	}
 
 	if err := dtlsConn.HandshakeContext(ctx1); err != nil {
+		_ = dtlsConn.Close()
 		return nil, err
 	}
 	return dtlsConn, nil
@@ -1470,9 +1471,9 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
 
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
-	defer dtlscancel()
-
 	conn1, conn2 := connutil.AsyncPacketPipe()
+	defer func() { _ = conn1.Close() }()
+	defer dtlscancel()
 	go func() {
 		for {
 			select {
@@ -1566,6 +1567,88 @@ type turnParams struct {
 	link     string
 	udp      bool
 	getCreds getCredsFunc
+}
+
+// bridgeTURNPackets forwards packets between a long-lived DTLS packet pipe and
+// one TURN allocation. Both readers must exit before this function returns: the
+// packet pipe is reused by the next TURN allocation, so leaving an old reader
+// behind would let it consume and drop packets after reconnect.
+func bridgeTURNPackets(ctx context.Context, relayConn, pipeConn net.PacketConn, peer net.Addr, streamID int) {
+	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	defer bridgeCancel()
+
+	var internalPipeAddr atomic.Value
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	deadlineDone := make(chan struct{})
+	stopDeadline := context.AfterFunc(bridgeCtx, func() {
+		defer close(deadlineDone)
+		now := time.Now()
+		if err := relayConn.SetDeadline(now); err != nil {
+			log.Printf("[STREAM %d] failed to interrupt TURN relay: %s", streamID, err)
+		}
+		if err := pipeConn.SetReadDeadline(now); err != nil {
+			log.Printf("[STREAM %d] failed to interrupt DTLS pipe reader: %s", streamID, err)
+		}
+	})
+
+	go func() {
+		defer wg.Done()
+		defer bridgeCancel()
+		buf := make([]byte, 1600)
+		for {
+			if bridgeCtx.Err() != nil {
+				return
+			}
+			n, addr, err := pipeConn.ReadFrom(buf)
+			if err != nil || bridgeCtx.Err() != nil {
+				return
+			}
+			if addr != nil {
+				internalPipeAddr.Store(addr)
+			}
+			if _, err = relayConn.WriteTo(buf[:n], peer); err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		defer bridgeCancel()
+		buf := make([]byte, 1600)
+		for {
+			if bridgeCtx.Err() != nil {
+				return
+			}
+			n, _, err := relayConn.ReadFrom(buf)
+			if err != nil || bridgeCtx.Err() != nil {
+				return
+			}
+			addr := internalPipeAddr.Load()
+			if addr == nil {
+				continue
+			}
+			if packetAddr, ok := addr.(net.Addr); ok {
+				if _, err = pipeConn.WriteTo(buf[:n], packetAddr); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+	bridgeCancel()
+	if !stopDeadline() {
+		<-deadlineDone
+	}
+	if err := relayConn.SetDeadline(time.Time{}); err != nil {
+		log.Printf("[STREAM %d] failed to clear TURN relay deadline: %s", streamID, err)
+	}
+	if err := pipeConn.SetReadDeadline(time.Time{}); err != nil {
+		log.Printf("[STREAM %d] failed to clear DTLS pipe deadline: %s", streamID, err)
+	}
 }
 
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, streamID int, c chan<- error) {
@@ -1680,67 +1763,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		log.Printf("[STREAM %d] relayed-address=%s", streamID, relayConn.LocalAddr().String())
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	turnctx, turncancel := context.WithCancel(ctx)
-	context.AfterFunc(turnctx, func() {
-		if err := relayConn.SetDeadline(time.Now()); err != nil {
-			log.Printf("Failed to set relay deadline: %s", err)
-		}
-		// Do not set conn2 deadline (conn2 can sometimes be listenConn if direct mode is used)
-	})
-	var internalPipeAddr atomic.Value
-
-	go func() {
-		defer turncancel()
-		buf := make([]byte, 1600)
-		for {
-			if turnctx.Err() != nil {
-				return
-			}
-			n, addr1, err1 := conn2.ReadFrom(buf)
-			if err1 != nil {
-				return
-			}
-			if turnctx.Err() != nil {
-				return
-			}
-
-			internalPipeAddr.Store(addr1)
-
-			_, err1 = relayConn.WriteTo(buf[:n], peer)
-			if err1 != nil {
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer turncancel()
-		buf := make([]byte, 1600)
-		for {
-			n, _, err1 := relayConn.ReadFrom(buf)
-			if err1 != nil {
-				return
-			}
-			addr1 := internalPipeAddr.Load()
-			if addr1 == nil {
-				continue
-			}
-
-			if addr, ok := addr1.(net.Addr); ok {
-				if _, err := conn2.WriteTo(buf[:n], addr); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	wg.Wait()
-	if err := relayConn.SetDeadline(time.Time{}); err != nil {
-		log.Printf("Failed to clear relay deadline: %s", err)
-	}
+	bridgeTURNPackets(ctx, relayConn, conn2, peer, streamID)
 }
 
 func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
