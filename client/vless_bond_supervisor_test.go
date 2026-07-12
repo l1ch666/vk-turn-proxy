@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -175,6 +176,115 @@ func TestVLESSBondGenerationRetryDelayIsBounded(t *testing.T) {
 		if delay < maxDelay/2 || delay > maxDelay {
 			t.Fatalf("attempt %d delay = %s, want %s..%s", attempt, delay, maxDelay/2, maxDelay)
 		}
+	}
+}
+
+func TestParseVLESSBondProtocolMode(t *testing.T) {
+	valid := map[string]vlessBondProtocolMode{
+		"":     vlessBondProtocolAuto,
+		"auto": vlessBondProtocolAuto,
+		"1":    vlessBondProtocolV1,
+		"v1":   vlessBondProtocolV1,
+		"2":    vlessBondProtocolV2,
+		"V2":   vlessBondProtocolV2,
+	}
+	for raw, want := range valid {
+		got, err := parseVLESSBondProtocolMode(raw)
+		if err != nil || got != want {
+			t.Errorf("parseVLESSBondProtocolMode(%q) = (%v, %v), want (%v, nil)", raw, got, err, want)
+		}
+	}
+	if _, err := parseVLESSBondProtocolMode("v3"); err == nil {
+		t.Fatal("unsupported protocol unexpectedly accepted")
+	}
+}
+
+func TestVLESSBondProtocolSelectorFallsBackOnlyWhenV2IsUnavailable(t *testing.T) {
+	selector := newVLESSBondProtocolSelector(vlessBondProtocolAuto)
+	var calls []int
+	generation, err := selector.create(context.Background(), func(_ context.Context, protocol int) (*vlessBondGeneration, error) {
+		calls = append(calls, protocol)
+		if protocol == tcputil.BondProtocolV2 {
+			return nil, fmt.Errorf("%w: old server closed path", errVLESSBondV2Unavailable)
+		}
+		return newVLESSBondGeneration("legacy", newFakeBondSmuxSession(), nil, nil), nil
+	})
+	if err != nil || generation == nil {
+		t.Fatalf("auto fallback = (%v, %v), want generation", generation, err)
+	}
+	wantCalls := []int{tcputil.BondProtocolV2, tcputil.BondProtocolV1}
+	if fmt.Sprint(calls) != fmt.Sprint(wantCalls) {
+		t.Fatalf("protocol calls = %v, want %v", calls, wantCalls)
+	}
+	if got := selector.protocol(); got != tcputil.BondProtocolV1 {
+		t.Fatalf("remembered protocol = v%d, want v1", got)
+	}
+}
+
+func TestVLESSBondProtocolSelectorDoesNotHideV2Rejection(t *testing.T) {
+	selector := newVLESSBondProtocolSelector(vlessBondProtocolAuto)
+	calls := 0
+	_, err := selector.create(context.Background(), func(_ context.Context, protocol int) (*vlessBondGeneration, error) {
+		calls++
+		if protocol != tcputil.BondProtocolV2 {
+			t.Fatalf("unexpected fallback to protocol v%d", protocol)
+		}
+		return nil, &tcputil.BondHelloRejectionError{Code: "PROFILE_MISMATCH"}
+	})
+	if !errors.Is(err, tcputil.ErrBondHelloRejected) {
+		t.Fatalf("selector error = %v, want explicit rejection", err)
+	}
+	if calls != 1 {
+		t.Fatalf("factory calls = %d, want 1", calls)
+	}
+}
+
+func TestWaitForFirstBondPathRequiresAllV2PathsToFail(t *testing.T) {
+	bonded := tcputil.NewBondedPacketConn("test-v2-negotiation")
+	defer func() { _ = bonded.Close() }()
+	events := make(chan vlessBondPathSetupEvent, 2)
+	events <- vlessBondPathSetupEvent{pathID: 0, err: fmt.Errorf("no acknowledgement")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- waitForFirstBondPath(ctx, bonded, events, tcputil.BondProtocolV2, 2)
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("one path failure ended negotiation early: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	left, right := net.Pipe()
+	done := bonded.AddConn(left, nil)
+	defer func() { _ = right.Close() }()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("successful second path returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("successful path did not finish negotiation")
+	}
+	_ = right.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("successful test path did not stop")
+	}
+}
+
+func TestWaitForFirstBondPathMarksV2UnavailableAfterAllPathsFail(t *testing.T) {
+	bonded := tcputil.NewBondedPacketConn("test-v2-unavailable")
+	defer func() { _ = bonded.Close() }()
+	events := make(chan vlessBondPathSetupEvent, 2)
+	events <- vlessBondPathSetupEvent{pathID: 0, err: fmt.Errorf("no acknowledgement")}
+	events <- vlessBondPathSetupEvent{pathID: 1, err: fmt.Errorf("connection closed")}
+	err := waitForFirstBondPath(context.Background(), bonded, events, tcputil.BondProtocolV2, 2)
+	if !errors.Is(err, errVLESSBondV2Unavailable) {
+		t.Fatalf("negotiation error = %v, want V2 unavailable", err)
 	}
 }
 

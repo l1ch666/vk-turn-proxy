@@ -25,6 +25,12 @@ After validating the profile, the server replies in its own DTLS record:
 VKTURNBOND/2 OK\n
 ```
 
+An understood but rejected V2 profile is reported before the path is closed:
+
+```text
+VKTURNBOND/2 ERR <CODE>\n
+```
+
 The client must receive this acknowledgement before starting KCP. MTU and FEC
 are wire-critical and must exactly match the server. Expected paths is limited
 to 1..64 and lets the server size the KCP window before every path has connected.
@@ -33,5 +39,7 @@ FEC is either `0 0` or two positive shard counts totaling at most 256.
 ## Rollout
 
 Deploy server support first. V1 clients remain compatible and do not receive an
-acknowledgement. A V2-capable client can probe for the V2 acknowledgement and
-recreate the bond with V1 when it is talking to an older server.
+acknowledgement. Client `auto` mode probes V2 first and remembers a V1 fallback
+for the lifetime of the process when every path lacks a V2 acknowledgement. An
+explicit V2 `ERR` does not fall back: profile mismatches must be corrected rather
+than hidden behind the profile-less V1 protocol.

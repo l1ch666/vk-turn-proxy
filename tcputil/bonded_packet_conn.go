@@ -17,11 +17,28 @@ const (
 	bondHelloV1Token = "VKTURNBOND/1"
 	bondHelloV2Token = "VKTURNBOND/2"
 	bondHelloV2Ack   = "VKTURNBOND/2 OK\n"
+	bondHelloV2Error = "ERR"
 	maxBondHelloSize = 256
 	MaxBondPaths     = 64
 	BondProtocolV1   = 1
 	BondProtocolV2   = 2
 )
+
+// ErrBondHelloRejected identifies an explicit V2 rejection from a new server.
+var ErrBondHelloRejected = errors.New("vless bond V2 hello rejected")
+
+// BondHelloRejectionError carries the stable machine-readable rejection code.
+type BondHelloRejectionError struct {
+	Code string
+}
+
+func (e *BondHelloRejectionError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrBondHelloRejected, e.Code)
+}
+
+func (e *BondHelloRejectionError) Unwrap() error {
+	return ErrBondHelloRejected
+}
 
 // BondHello is the per-path control record sent before KCP traffic. V1 carries
 // only a bond ID. V2 also carries the wire-critical KCP profile and is confirmed
@@ -395,6 +412,16 @@ func WriteBondHelloAck(conn net.Conn) error {
 	return writeBondControlLine(conn, bondHelloV2Ack)
 }
 
+// WriteBondHelloReject reports a stable V2 rejection code before closing a
+// path, allowing an auto-mode client to distinguish incompatibility from an old
+// server that does not understand V2 at all.
+func WriteBondHelloReject(conn net.Conn, code string) error {
+	if !isValidBondRejectionCode(code) {
+		return fmt.Errorf("invalid vless bond rejection code %q", code)
+	}
+	return writeBondControlLine(conn, fmt.Sprintf("%s %s %s\n", bondHelloV2Token, bondHelloV2Error, code))
+}
+
 // ReadBondHello reads the bond hello line. It relies on DTLS datagram framing:
 // the peer sends the hello via a single WriteBondHello (its own DTLS record), so
 // the first read returns exactly the hello line and no subsequent KCP data is
@@ -422,10 +449,14 @@ func ReadBondHelloAck(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
-	if line != strings.TrimSpace(bondHelloV2Ack) {
-		return fmt.Errorf("unexpected vless bond V2 acknowledgement %q", line)
+	if line == strings.TrimSpace(bondHelloV2Ack) {
+		return nil
 	}
-	return nil
+	fields := strings.Fields(line)
+	if len(fields) == 3 && fields[0] == bondHelloV2Token && fields[1] == bondHelloV2Error && isValidBondRejectionCode(fields[2]) {
+		return &BondHelloRejectionError{Code: fields[2]}
+	}
+	return fmt.Errorf("unexpected vless bond V2 acknowledgement %q", line)
 }
 
 // ValidateBondHelloTuning checks that a received V2 wire profile matches the
@@ -566,6 +597,25 @@ func isValidBondID(value string) bool {
 			continue
 		}
 		if r >= '0' && r <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isValidBondRejectionCode(code string) bool {
+	if len(code) < 1 || len(code) > 32 {
+		return false
+	}
+	for _, r := range code {
+		if r >= 'A' && r <= 'Z' {
+			continue
+		}
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if r == '_' {
 			continue
 		}
 		return false

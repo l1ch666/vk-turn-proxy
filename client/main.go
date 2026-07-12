@@ -1867,6 +1867,7 @@ func main() {
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	vlessBond := flag.Bool("vless-bond", false, "VLESS bond mode: packet-level multipath across TURN/DTLS streams; requires -vless")
+	vlessBondProtocol := flag.String("vless-bond-protocol", "auto", "VLESS bond control protocol: auto, v1, or v2")
 	dnsMode := flag.String("dns", "auto", "DNS mode for VK resolver: auto, udp, or doh")
 	dnsServers := flag.String("dns-servers", "", "comma-separated DNS resolvers for VK auth, with optional ports")
 	wrap := flag.Bool("wrap", false, "accept WRAP compatibility mode")
@@ -1889,6 +1890,10 @@ func main() {
 		}
 		fmt.Println(key)
 		return
+	}
+	bondProtocolMode, protocolErr := parseVLESSBondProtocolMode(*vlessBondProtocol)
+	if protocolErr != nil {
+		log.Fatalf("%s", protocolErr)
 	}
 	if err := validateClientVLESSFlags(*vlessMode, *vlessBond, *n); err != nil {
 		log.Fatalf("%s", err)
@@ -1967,7 +1972,7 @@ func main() {
 	}
 
 	if *vlessMode {
-		runVLESSMode(ctx, params, peer, *listen, *n, *vlessBond)
+		runVLESSMode(ctx, params, peer, *listen, *n, *vlessBond, bondProtocolMode)
 		return
 	}
 
@@ -2239,9 +2244,17 @@ func generateBondID() (string, error) {
 // runVLESSMode implements TCP forwarding with round-robin across N TURN sessions.
 // Without vlessBond, one TCP connection is pinned to one smux session, while
 // different TCP connections are distributed across the active TURN/DTLS pool.
-func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int, vlessBond bool) {
+func runVLESSMode(
+	ctx context.Context,
+	tp *turnParams,
+	peer *net.UDPAddr,
+	listenAddr string,
+	numSessions int,
+	vlessBond bool,
+	protocolMode vlessBondProtocolMode,
+) {
 	if vlessBond {
-		runVLESSBondMode(ctx, tp, peer, listenAddr, numSessions)
+		runVLESSBondMode(ctx, tp, peer, listenAddr, numSessions, protocolMode)
 		return
 	}
 
@@ -2323,8 +2336,15 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 	}
 }
 
-func runVLESSBondMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
-	runSupervisedVLESSBondMode(ctx, tp, peer, listenAddr, numSessions)
+func runVLESSBondMode(
+	ctx context.Context,
+	tp *turnParams,
+	peer *net.UDPAddr,
+	listenAddr string,
+	numSessions int,
+	protocolMode vlessBondProtocolMode,
+) {
+	runSupervisedVLESSBondMode(ctx, tp, peer, listenAddr, numSessions, protocolMode)
 }
 
 func enabledText(enabled bool) string {
@@ -2386,7 +2406,15 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 	}
 }
 
-func maintainVLESSBondPath(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, bondID string, bonded *tcputil.BondedPacketConn) {
+func maintainVLESSBondPath(
+	ctx context.Context,
+	tp *turnParams,
+	peer *net.UDPAddr,
+	id int,
+	hello tcputil.BondHello,
+	bonded *tcputil.BondedPacketConn,
+	setupEvents chan<- vlessBondPathSetupEvent,
+) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -2414,13 +2442,25 @@ func maintainVLESSBondPath(ctx context.Context, tp *turnParams, peer *net.UDPAdd
 			return
 		}
 
-		if err := tcputil.WriteBondHello(dtlsConn, bondID); err != nil {
+		if err := tcputil.WriteBondHelloConfig(dtlsConn, hello); err != nil {
 			log.Printf("[bond path %d] hello error: %s, retrying...", id, err)
+			reportVLESSBondPathSetupError(setupEvents, id, fmt.Errorf("write bond hello: %w", err))
 			cleanup()
 			if !waitContextDelay(ctx, vlessBondPathRetryDelay(3*time.Second)) {
 				return
 			}
 			continue
+		}
+		if hello.Version == tcputil.BondProtocolV2 {
+			if err := tcputil.ReadBondHelloAck(dtlsConn); err != nil {
+				log.Printf("[bond path %d] V2 acknowledgement error: %s, retrying...", id, err)
+				reportVLESSBondPathSetupError(setupEvents, id, fmt.Errorf("read bond V2 acknowledgement: %w", err))
+				cleanup()
+				if !waitContextDelay(ctx, vlessBondPathRetryDelay(3*time.Second)) {
+					return
+				}
+				continue
+			}
 		}
 		if ctx.Err() != nil {
 			cleanup()
@@ -2440,6 +2480,16 @@ func maintainVLESSBondPath(ctx context.Context, tp *turnParams, peer *net.UDPAdd
 		if !waitContextDelay(ctx, vlessBondPathRetryDelay(2*time.Second)) {
 			return
 		}
+	}
+}
+
+func reportVLESSBondPathSetupError(events chan<- vlessBondPathSetupEvent, pathID int, err error) {
+	if events == nil || err == nil {
+		return
+	}
+	select {
+	case events <- vlessBondPathSetupEvent{pathID: pathID, err: err}:
+	default:
 	}
 }
 

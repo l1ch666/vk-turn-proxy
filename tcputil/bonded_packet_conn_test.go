@@ -1,6 +1,7 @@
 package tcputil
 
 import (
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -184,6 +185,26 @@ func TestBondHelloV2RoundTripAndAck(t *testing.T) {
 	}
 	if err := <-clientDone; err != nil {
 		t.Fatalf("client handshake failed: %v", err)
+	}
+}
+
+func TestBondHelloV2RejectionRoundTrip(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- WriteBondHelloReject(serverConn, "PROFILE_MISMATCH") }()
+	err := ReadBondHelloAck(clientConn)
+	if !errors.Is(err, ErrBondHelloRejected) {
+		t.Fatalf("rejection error = %v, want ErrBondHelloRejected", err)
+	}
+	var rejection *BondHelloRejectionError
+	if !errors.As(err, &rejection) || rejection.Code != "PROFILE_MISMATCH" {
+		t.Fatalf("rejection = %#v, want PROFILE_MISMATCH", rejection)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write rejection: %v", err)
 	}
 }
 

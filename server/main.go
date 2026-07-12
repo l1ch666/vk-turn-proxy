@@ -239,14 +239,15 @@ func (m *vlessBondManager) Add(ctx context.Context, conn net.Conn) error {
 		return err
 	}
 	if err := tcputil.ValidateBondHelloTuning(hello); err != nil {
-		return err
+		return rejectV2BondHello(conn, hello, "PROFILE_MISMATCH", err)
 	}
 	bondID := hello.BondID
 	m.mu.Lock()
 	existing := m.groups[bondID]
 	if existing != nil && !existing.matchesHello(hello) {
 		m.mu.Unlock()
-		return fmt.Errorf("vless bond %s path profile does not match the existing group", existing.shortID())
+		return rejectV2BondHello(conn, hello, "GROUP_MISMATCH",
+			fmt.Errorf("vless bond %s path profile does not match the existing group", existing.shortID()))
 	}
 	m.mu.Unlock()
 	if hello.Version == tcputil.BondProtocolV2 {
@@ -290,6 +291,16 @@ func (m *vlessBondManager) Add(ctx context.Context, conn net.Conn) error {
 		}()
 	})
 	return nil
+}
+
+func rejectV2BondHello(conn net.Conn, hello tcputil.BondHello, code string, cause error) error {
+	if hello.Version != tcputil.BondProtocolV2 {
+		return cause
+	}
+	if err := tcputil.WriteBondHelloReject(conn, code); err != nil {
+		return fmt.Errorf("%w (also failed to send V2 rejection %s: %v)", cause, code, err)
+	}
+	return cause
 }
 
 func (m *vlessBondManager) Wait() {

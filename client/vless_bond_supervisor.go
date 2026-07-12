@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +16,93 @@ import (
 	"github.com/xtaci/smux"
 )
 
-const vlessBondStableGeneration = time.Minute
+const (
+	vlessBondStableGeneration = time.Minute
+	vlessBondV2FallbackGrace  = 8 * time.Second
+)
+
+var errVLESSBondV2Unavailable = errors.New("vless bond V2 unavailable")
+
+type vlessBondProtocolMode int
+
+const (
+	vlessBondProtocolAuto vlessBondProtocolMode = iota
+	vlessBondProtocolV1
+	vlessBondProtocolV2
+)
+
+func parseVLESSBondProtocolMode(raw string) (vlessBondProtocolMode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "auto":
+		return vlessBondProtocolAuto, nil
+	case "1", "v1":
+		return vlessBondProtocolV1, nil
+	case "2", "v2":
+		return vlessBondProtocolV2, nil
+	default:
+		return vlessBondProtocolAuto, fmt.Errorf("unsupported VLESS bond protocol %q (expected auto, v1, or v2)", raw)
+	}
+}
+
+func (m vlessBondProtocolMode) String() string {
+	switch m {
+	case vlessBondProtocolV1:
+		return "v1"
+	case vlessBondProtocolV2:
+		return "v2"
+	default:
+		return "auto"
+	}
+}
+
+type vlessBondProtocolSelector struct {
+	mode     vlessBondProtocolMode
+	mu       sync.Mutex
+	legacyV1 bool
+}
+
+type vlessBondProtocolFactory func(context.Context, int) (*vlessBondGeneration, error)
+
+func newVLESSBondProtocolSelector(mode vlessBondProtocolMode) *vlessBondProtocolSelector {
+	return &vlessBondProtocolSelector{mode: mode}
+}
+
+func (s *vlessBondProtocolSelector) protocol() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.mode {
+	case vlessBondProtocolV1:
+		return tcputil.BondProtocolV1
+	case vlessBondProtocolV2:
+		return tcputil.BondProtocolV2
+	default:
+		if s.legacyV1 {
+			return tcputil.BondProtocolV1
+		}
+		return tcputil.BondProtocolV2
+	}
+}
+
+func (s *vlessBondProtocolSelector) create(ctx context.Context, factory vlessBondProtocolFactory) (*vlessBondGeneration, error) {
+	protocol := s.protocol()
+	generation, err := factory(ctx, protocol)
+	if s.mode != vlessBondProtocolAuto || protocol != tcputil.BondProtocolV2 || !errors.Is(err, errVLESSBondV2Unavailable) {
+		return generation, err
+	}
+	if generation != nil {
+		generation.close()
+	}
+	s.mu.Lock()
+	s.legacyV1 = true
+	s.mu.Unlock()
+	log.Printf("VLESS bond: V2 acknowledgement unavailable; falling back to V1 for this process")
+	return factory(ctx, tcputil.BondProtocolV1)
+}
+
+type vlessBondPathSetupEvent struct {
+	pathID int
+	err    error
+}
 
 type bondSmuxSession interface {
 	OpenStream() (*smux.Stream, error)
@@ -171,7 +259,7 @@ func superviseVLESSBond(
 
 		generation, err := factory(ctx)
 		if err == nil && generation == nil {
-			err = fmt.Errorf("VLESS bond generation factory returned nil")
+			err = fmt.Errorf("vless bond generation factory returned nil")
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -209,6 +297,7 @@ func createVLESSBondGeneration(
 	tp *turnParams,
 	peer *net.UDPAddr,
 	numSessions int,
+	protocol int,
 ) (*vlessBondGeneration, error) {
 	bondID, err := generateBondID()
 	if err != nil {
@@ -216,6 +305,15 @@ func createVLESSBondGeneration(
 	}
 	generationCtx, cancel := context.WithCancel(ctx)
 	bonded := tcputil.NewBondedPacketConn("vless-bond-client:" + bondID)
+	hello := tcputil.BondHello{Version: tcputil.BondProtocolV1, BondID: bondID}
+	if protocol == tcputil.BondProtocolV2 {
+		hello = tcputil.CurrentBondHello(bondID, numSessions)
+	} else if protocol != tcputil.BondProtocolV1 {
+		cancel()
+		_ = bonded.Close()
+		return nil, fmt.Errorf("unsupported VLESS bond protocol version %d", protocol)
+	}
+	setupEvents := make(chan vlessBondPathSetupEvent, numSessions)
 	var (
 		pathWG      sync.WaitGroup
 		kcpSession  *kcp.UDPSession
@@ -243,12 +341,12 @@ func createVLESSBondGeneration(
 			if !waitContextDelay(generationCtx, time.Duration(id)*300*time.Millisecond) {
 				return
 			}
-			maintainVLESSBondPath(generationCtx, tp, peer, id, bondID, bonded)
+			maintainVLESSBondPath(generationCtx, tp, peer, id, hello, bonded, setupEvents)
 		}(i)
 	}
 
-	log.Printf("VLESS bond generation %s: waiting for first path (total: %d)", shortBondID(bondID), numSessions)
-	if err := waitForFirstBondPath(generationCtx, bonded); err != nil {
+	log.Printf("VLESS bond generation %s: waiting for first path (total: %d, protocol: v%d)", shortBondID(bondID), numSessions, protocol)
+	if err := waitForFirstBondPath(generationCtx, bonded, setupEvents, protocol, numSessions); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -256,18 +354,36 @@ func createVLESSBondGeneration(
 	kcpSession, err = tcputil.NewKCPOverPacketConnBonded(bonded, bonded.RemoteAddr(), false, numSessions)
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("VLESS bond KCP session: %w", err)
+		return nil, fmt.Errorf("vless bond KCP session: %w", err)
 	}
 	smuxSession, err = smux.Client(kcpSession, tcputil.DefaultSmuxConfig())
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("VLESS bond smux client: %w", err)
+		return nil, fmt.Errorf("vless bond smux client: %w", err)
 	}
 	log.Printf("VLESS bond generation %s established (active paths: %d)", shortBondID(bondID), bonded.Count())
 	return newVLESSBondGeneration(bondID, smuxSession, bonded, cleanup), nil
 }
 
-func waitForFirstBondPath(ctx context.Context, bonded *tcputil.BondedPacketConn) error {
+func waitForFirstBondPath(
+	ctx context.Context,
+	bonded *tcputil.BondedPacketConn,
+	setupEvents <-chan vlessBondPathSetupEvent,
+	protocol int,
+	expectedPaths int,
+) error {
+	if expectedPaths < 1 {
+		return fmt.Errorf("vless bond expected path count must be positive")
+	}
+	failedPaths := make(map[int]struct{}, expectedPaths)
+	var lastSetupErr error
+	var fallbackTimer *time.Timer
+	var fallbackDeadline <-chan time.Time
+	defer func() {
+		if fallbackTimer != nil {
+			fallbackTimer.Stop()
+		}
+	}()
 	for {
 		if bonded.Count() > 0 {
 			return nil
@@ -276,11 +392,38 @@ func waitForFirstBondPath(ctx context.Context, bonded *tcputil.BondedPacketConn)
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-bonded.StateChanged():
+		case <-fallbackDeadline:
+			if bonded.Count() == 0 {
+				return fmt.Errorf("%w after %s: %v", errVLESSBondV2Unavailable, vlessBondV2FallbackGrace, lastSetupErr)
+			}
+		case event := <-setupEvents:
+			if errors.Is(event.err, tcputil.ErrBondHelloRejected) {
+				return event.err
+			}
+			if protocol != tcputil.BondProtocolV2 {
+				continue
+			}
+			failedPaths[event.pathID] = struct{}{}
+			lastSetupErr = event.err
+			if fallbackTimer == nil {
+				fallbackTimer = time.NewTimer(vlessBondV2FallbackGrace)
+				fallbackDeadline = fallbackTimer.C
+			}
+			if len(failedPaths) >= expectedPaths && bonded.Count() == 0 {
+				return fmt.Errorf("%w: %v", errVLESSBondV2Unavailable, lastSetupErr)
+			}
 		}
 	}
 }
 
-func runSupervisedVLESSBondMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
+func runSupervisedVLESSBondMode(
+	ctx context.Context,
+	tp *turnParams,
+	peer *net.UDPAddr,
+	listenAddr string,
+	numSessions int,
+	protocolMode vlessBondProtocolMode,
+) {
 	numSessions = normalizeVLESSSessionCount(numSessions)
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -292,14 +435,18 @@ func runSupervisedVLESSBondMode(ctx context.Context, tp *turnParams, peer *net.U
 	log.Printf("vless mode: enabled")
 	log.Printf("vless bond: enabled")
 	log.Printf("vless bond semantics: packet-level multipath over %d TURN/DTLS paths", numSessions)
+	log.Printf("vless bond protocol: %s", protocolMode)
 
 	slot := newVLESSBondSessionSlot()
+	protocolSelector := newVLESSBondProtocolSelector(protocolMode)
 	var supervisorWG sync.WaitGroup
 	supervisorWG.Add(1)
 	go func() {
 		defer supervisorWG.Done()
 		superviseVLESSBond(ctx, slot, func(factoryCtx context.Context) (*vlessBondGeneration, error) {
-			return createVLESSBondGeneration(factoryCtx, tp, peer, numSessions)
+			return protocolSelector.create(factoryCtx, func(protocolCtx context.Context, protocol int) (*vlessBondGeneration, error) {
+				return createVLESSBondGeneration(protocolCtx, tp, peer, numSessions, protocol)
+			})
 		}, vlessBondGenerationRetryDelay)
 	}()
 

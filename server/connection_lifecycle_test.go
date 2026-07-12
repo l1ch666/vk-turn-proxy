@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -328,4 +329,36 @@ func TestVLESSBondManagerAcceptsV2AndAcknowledges(t *testing.T) {
 	}
 	cancel()
 	manager.Wait()
+}
+
+func TestVLESSBondManagerRejectsMismatchedV2ProfileWithNACK(t *testing.T) {
+	manager := newVLESSBondManager("127.0.0.1:1")
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+
+	hello := tcputil.CurrentBondHello("0123456789abcdef", 2)
+	if hello.MTU > 50 {
+		hello.MTU--
+	} else {
+		hello.MTU++
+	}
+	clientDone := make(chan error, 1)
+	go func() {
+		if err := tcputil.WriteBondHelloConfig(clientConn, hello); err != nil {
+			clientDone <- err
+			return
+		}
+		clientDone <- tcputil.ReadBondHelloAck(clientConn)
+	}()
+
+	err := manager.Add(context.Background(), serverConn)
+	if err == nil {
+		t.Fatal("mismatched V2 profile unexpectedly accepted")
+	}
+	if ackErr := <-clientDone; !errors.Is(ackErr, tcputil.ErrBondHelloRejected) {
+		t.Fatalf("client response error = %v, want explicit V2 rejection", ackErr)
+	}
 }
