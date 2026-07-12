@@ -69,6 +69,8 @@ type bondedPath struct {
 	conn    net.Conn
 	cleanup func()
 	done    chan struct{}
+	closing atomic.Bool
+	stats   *metrics.Path
 }
 
 // BondedPacketConn exposes several DTLS net.Conn paths as one PacketConn.
@@ -76,7 +78,8 @@ type bondedPath struct {
 // currently alive paths. This is the actual VLESS bond primitive: one smux TCP
 // stream can use multiple TURN/DTLS allocations instead of being pinned to one.
 type BondedPacketConn struct {
-	label string
+	label          string
+	metricRegistry *metrics.Registry
 
 	mu       sync.RWMutex
 	paths    []*bondedPath
@@ -99,12 +102,13 @@ func NewBondedPacketConn(label string) *BondedPacketConn {
 		label = "vless-bond"
 	}
 	return &BondedPacketConn{
-		label:      label,
-		readCh:     make(chan bondedPacket, 1024),
-		stateCh:    make(chan struct{}, 1),
-		closed:     make(chan struct{}),
-		localAddr:  bondAddr(label + "/local"),
-		remoteAddr: bondAddr(label + "/remote"),
+		label:          label,
+		metricRegistry: &metrics.Process,
+		readCh:         make(chan bondedPacket, 1024),
+		stateCh:        make(chan struct{}, 1),
+		closed:         make(chan struct{}),
+		localAddr:      bondAddr(label + "/local"),
+		remoteAddr:     bondAddr(label + "/remote"),
 	}
 }
 
@@ -131,7 +135,7 @@ func (b *BondedPacketConn) AddConn(conn net.Conn, cleanup func()) <-chan struct{
 	default:
 	}
 	b.paths = append(b.paths, path)
-	metrics.Process.PathOpened()
+	path.stats = b.metricRegistry.OpenPath(fmt.Sprintf("%s/path-%d", b.label, path.id))
 	b.mu.Unlock()
 	b.notifyStateChanged()
 
@@ -186,8 +190,13 @@ func (b *BondedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		if deadline, ok := b.writeDeadline.Load().(time.Time); ok {
 			_ = path.conn.SetWriteDeadline(deadline)
 		}
+		started := path.stats.BeginWrite()
 		n, err := path.conn.Write(p)
-		if err == nil && n == len(p) {
+		if err == nil && n != len(p) {
+			err = ioShortWrite(n, len(p))
+		}
+		path.stats.ObserveWrite(started, n, err)
+		if err == nil {
 			return n, nil
 		}
 
@@ -198,9 +207,6 @@ func (b *BondedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		// under normal loss, collapsing throughput to one stream (~5 Mbit) and
 		// causing reconnect churn. On a transient error we keep the path and just
 		// try the next one for THIS packet; KCP retransmits anything truly lost.
-		if err == nil {
-			err = ioShortWrite(n, len(p))
-		}
 		lastErr = err
 		if isPermanentPathError(err) {
 			b.removePath(path, true)
@@ -302,8 +308,14 @@ func (b *BondedPacketConn) readLoop(path *bondedPath) {
 	for {
 		n, err := path.conn.Read(buf)
 		if err != nil {
+			if !path.closing.Load() {
+				path.stats.ObserveRead(n, err)
+			} else if n > 0 {
+				path.stats.ObserveRead(n, nil)
+			}
 			return
 		}
+		path.stats.ObserveRead(n, nil)
 		if n == 0 {
 			continue
 		}
@@ -331,7 +343,8 @@ func (b *BondedPacketConn) removePath(path *bondedPath, closeConn bool) {
 	for i, current := range b.paths {
 		if current == path {
 			b.paths = append(b.paths[:i], b.paths[i+1:]...)
-			metrics.Process.PathClosed()
+			path.closing.Store(true)
+			path.stats.Close()
 			removed = true
 			break
 		}

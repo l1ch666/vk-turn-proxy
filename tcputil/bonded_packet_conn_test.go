@@ -5,8 +5,12 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cacggghp/vk-turn-proxy/metrics"
 )
 
 func TestBondedPacketConnWritesAcrossPaths(t *testing.T) {
@@ -104,6 +108,77 @@ func TestBondedPacketConnNotifiesPathStateChanges(t *testing.T) {
 	}
 	if pc.Count() != 0 {
 		t.Fatalf("path count after removal = %d, want 0", pc.Count())
+	}
+}
+
+func TestBondedPacketConnRecordsPathTraffic(t *testing.T) {
+	var registry metrics.Registry
+	pc := NewBondedPacketConn("test-metrics")
+	pc.metricRegistry = &registry
+	defer func() { _ = pc.Close() }()
+
+	left, right := net.Pipe()
+	done := pc.AddConn(left, nil)
+
+	outgoing := []byte("outgoing")
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, len(outgoing))
+		_, err := io.ReadFull(right, buf)
+		if err == nil && string(buf) != string(outgoing) {
+			err = &unexpectedPacketError{got: string(buf), want: string(outgoing)}
+		}
+		readDone <- err
+	}()
+	if _, err := pc.WriteTo(outgoing, nil); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatalf("read outgoing packet: %v", err)
+	}
+
+	incoming := []byte("incoming")
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := right.Write(incoming)
+		writeDone <- err
+	}()
+	buf := make([]byte, 32)
+	n, _, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom failed: %v", err)
+	}
+	if got := string(buf[:n]); got != string(incoming) {
+		t.Fatalf("ReadFrom = %q, want %q", got, incoming)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write incoming packet: %v", err)
+	}
+
+	snapshot := registry.Snapshot()
+	if snapshot.ActivePaths != 1 || len(snapshot.Paths) != 1 {
+		t.Fatalf("active snapshot = %+v, want one path", snapshot)
+	}
+	path := snapshot.Paths[0]
+	if path.Label != "test-metrics/path-1" || !path.Active ||
+		path.BytesRead != uint64(len(incoming)) || path.BytesWritten != uint64(len(outgoing)) ||
+		path.ReadOperations != 1 || path.WriteOperations != 1 ||
+		path.ReadErrors != 0 || path.WriteErrors != 0 || path.WriteLatencySamples != 1 {
+		t.Fatalf("active path snapshot = %+v", path)
+	}
+
+	if err := right.Close(); err != nil {
+		t.Fatalf("close peer: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("path reader did not stop after peer close")
+	}
+
+	snapshot = registry.Snapshot()
+	if snapshot.ActivePaths != 0 || len(snapshot.Paths) != 1 || snapshot.Paths[0].Active || snapshot.Paths[0].ReadErrors != 1 {
+		t.Fatalf("closed snapshot = %+v, want one closed path with a read error", snapshot)
 	}
 }
 
@@ -355,10 +430,19 @@ func (e *unexpectedPacketError) Error() string {
 type scriptedConn struct {
 	writeErr   error
 	writeCalls int
-	closed     bool
+	closed     atomic.Bool
+	closeOnce  sync.Once
+	closedCh   chan struct{}
 }
 
-func (c *scriptedConn) Read(b []byte) (int, error) { return 0, io.EOF }
+func newScriptedConn(writeErr error) *scriptedConn {
+	return &scriptedConn{writeErr: writeErr, closedCh: make(chan struct{})}
+}
+
+func (c *scriptedConn) Read(b []byte) (int, error) {
+	<-c.closedCh
+	return 0, net.ErrClosed
+}
 func (c *scriptedConn) Write(b []byte) (int, error) {
 	c.writeCalls++
 	if c.writeErr != nil {
@@ -366,7 +450,11 @@ func (c *scriptedConn) Write(b []byte) (int, error) {
 	}
 	return len(b), nil
 }
-func (c *scriptedConn) Close() error                       { c.closed = true; return nil }
+func (c *scriptedConn) Close() error {
+	c.closed.Store(true)
+	c.closeOnce.Do(func() { close(c.closedCh) })
+	return nil
+}
 func (c *scriptedConn) LocalAddr() net.Addr                { return bondAddr("local") }
 func (c *scriptedConn) RemoteAddr() net.Addr               { return bondAddr("remote") }
 func (c *scriptedConn) SetDeadline(t time.Time) error      { return nil }
@@ -409,7 +497,7 @@ func (e errStr) Error() string { return string(e) }
 func TestTransientWriteKeepsPath(t *testing.T) {
 	pc := NewBondedPacketConn("test")
 	defer func() { _ = pc.Close() }()
-	c := &scriptedConn{writeErr: timeoutErr{}}
+	c := newScriptedConn(timeoutErr{})
 	pc.AddConn(c, nil)
 	if pc.Count() != 1 {
 		t.Fatalf("expected 1 path, got %d", pc.Count())
@@ -421,7 +509,7 @@ func TestTransientWriteKeepsPath(t *testing.T) {
 	if pc.Count() != 1 {
 		t.Fatalf("transient write errors removed the path (count=%d) — regression", pc.Count())
 	}
-	if c.closed {
+	if c.closed.Load() {
 		t.Fatalf("transient write error closed the path conn — regression")
 	}
 }
@@ -430,7 +518,7 @@ func TestTransientWriteKeepsPath(t *testing.T) {
 func TestPermanentWriteRemovesPath(t *testing.T) {
 	pc := NewBondedPacketConn("test")
 	defer func() { _ = pc.Close() }()
-	c := &scriptedConn{writeErr: net.ErrClosed}
+	c := newScriptedConn(net.ErrClosed)
 	pc.AddConn(c, nil)
 	_, _ = pc.WriteTo([]byte("x"), nil)
 	if pc.Count() != 0 {

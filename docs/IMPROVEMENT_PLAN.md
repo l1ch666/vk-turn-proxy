@@ -33,7 +33,7 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 ## Phase 3: observability and baseline
 
 - [x] Count active paths/sessions, reconnects, authentication failures, and queue drops.
-- [ ] Record bytes, write latency, and errors per path.
+- [x] Record bytes, write latency, and errors per path.
 - [ ] Export KCP retransmission and FEC recovery counters.
 - [ ] Add an opt-in loopback diagnostics endpoint and protected pprof support.
 - [ ] Establish reproducible `iperf3` baselines for TCP/UDP TURN, multi-session/bond, upload/download, and one/many flows.
