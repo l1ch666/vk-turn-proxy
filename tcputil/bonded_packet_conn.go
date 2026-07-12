@@ -65,6 +65,7 @@ type BondedPacketConn struct {
 	nextID   uint64
 
 	readCh    chan bondedPacket
+	stateCh   chan struct{}
 	closeOnce sync.Once
 	closed    chan struct{}
 
@@ -81,6 +82,7 @@ func NewBondedPacketConn(label string) *BondedPacketConn {
 	return &BondedPacketConn{
 		label:      label,
 		readCh:     make(chan bondedPacket, 1024),
+		stateCh:    make(chan struct{}, 1),
 		closed:     make(chan struct{}),
 		localAddr:  bondAddr(label + "/local"),
 		remoteAddr: bondAddr(label + "/remote"),
@@ -111,6 +113,7 @@ func (b *BondedPacketConn) AddConn(conn net.Conn, cleanup func()) <-chan struct{
 	}
 	b.paths = append(b.paths, path)
 	b.mu.Unlock()
+	b.notifyStateChanged()
 
 	go b.readLoop(path)
 	return path.done
@@ -120,6 +123,13 @@ func (b *BondedPacketConn) Count() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.paths)
+}
+
+// StateChanged is notified when a path is added or removed, or when the bond is
+// closed. Notifications are coalesced; consumers must re-read Count after each
+// wake-up instead of assuming one notification per transition.
+func (b *BondedPacketConn) StateChanged() <-chan struct{} {
+	return b.stateCh
 }
 
 func (b *BondedPacketConn) RemoteAddr() net.Addr {
@@ -225,6 +235,7 @@ func isPermanentPathError(err error) bool {
 func (b *BondedPacketConn) Close() error {
 	b.closeOnce.Do(func() {
 		close(b.closed)
+		b.notifyStateChanged()
 		for _, path := range b.snapshotPaths() {
 			b.removePath(path, true)
 		}
@@ -307,6 +318,7 @@ func (b *BondedPacketConn) removePath(path *bondedPath, closeConn bool) {
 	b.mu.Unlock()
 
 	if removed {
+		b.notifyStateChanged()
 		if closeConn {
 			_ = path.conn.Close()
 		}
@@ -314,6 +326,13 @@ func (b *BondedPacketConn) removePath(path *bondedPath, closeConn bool) {
 			path.cleanup()
 		}
 		close(path.done)
+	}
+}
+
+func (b *BondedPacketConn) notifyStateChanged() {
+	select {
+	case b.stateCh <- struct{}{}:
+	default:
 	}
 }
 

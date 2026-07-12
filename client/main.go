@@ -2147,6 +2147,9 @@ func validateClientVLESSFlags(vlessMode, vlessBond bool, streamCount int) error 
 	if vlessMode && streamCount < 0 {
 		return fmt.Errorf("VLESS session count must not be negative")
 	}
+	if vlessMode && vlessBond && streamCount > tcputil.MaxBondPaths {
+		return fmt.Errorf("VLESS bond session count must not exceed %d", tcputil.MaxBondPaths)
+	}
 	return nil
 }
 
@@ -2321,106 +2324,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 }
 
 func runVLESSBondMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
-	numSessions = normalizeVLESSSessionCount(numSessions)
-	bondID, err := generateBondID()
-	if err != nil {
-		log.Panicf("generate vless bond id: %s", err)
-	}
-	bonded := tcputil.NewBondedPacketConn("vless-bond-client:" + bondID)
-	defer func() { _ = bonded.Close() }()
-
-	log.Printf("vless mode: enabled")
-	log.Printf("vless bond: enabled")
-	log.Printf("vless bond semantics: packet-level multipath over %d TURN/DTLS paths", numSessions)
-
-	var wgMaint sync.WaitGroup
-	for i := 0; i < numSessions; i++ {
-		wgMaint.Add(1)
-		go func(id int) {
-			defer wgMaint.Done()
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(id) * 300 * time.Millisecond):
-			}
-			maintainVLESSBondPath(ctx, tp, peer, id, bondID, bonded)
-		}(i)
-	}
-
-	log.Printf("VLESS bond: waiting for first path to connect (total: %d)...", numSessions)
-	for {
-		select {
-		case <-ctx.Done():
-			_ = bonded.Close()
-			wgMaint.Wait()
-			return
-		case <-time.After(100 * time.Millisecond):
-		}
-		if bonded.Count() > 0 {
-			break
-		}
-	}
-
-	kcpSess, err := tcputil.NewKCPOverPacketConnBonded(bonded, bonded.RemoteAddr(), false, numSessions)
-	if err != nil {
-		_ = bonded.Close()
-		wgMaint.Wait()
-		log.Panicf("VLESS bond KCP session: %s", err)
-	}
-	defer func() { _ = kcpSess.Close() }()
-	log.Printf("KCP session established (vless bond)")
-
-	smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
-	if err != nil {
-		_ = bonded.Close()
-		wgMaint.Wait()
-		log.Panicf("VLESS bond smux client: %s", err)
-	}
-	defer func() { _ = smuxSess.Close() }()
-	log.Printf("smux session established (vless bond)")
-
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Panicf("TCP listen: %s", err)
-	}
-	context.AfterFunc(ctx, func() { _ = listener.Close() })
-	log.Printf("VLESS bond: listening on %s (single smux session, %d bonded paths)", listenAddr, numSessions)
-
-	var wgConn sync.WaitGroup
-	for {
-		tcpConn, err := listener.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				wgConn.Wait()
-				_ = bonded.Close()
-				wgMaint.Wait()
-				return
-			default:
-			}
-			log.Printf("TCP accept error: %s", err)
-			continue
-		}
-
-		if smuxSess.IsClosed() {
-			log.Printf("VLESS bond smux session is closed, rejecting connection")
-			_ = tcpConn.Close()
-			continue
-		}
-
-		wgConn.Add(1)
-		go func(tc net.Conn) {
-			defer wgConn.Done()
-			defer func() { _ = tc.Close() }()
-			stream, err := smuxSess.OpenStream()
-			if err != nil {
-				log.Printf("smux open stream error: %s", err)
-				return
-			}
-			defer func() { _ = stream.Close() }()
-			pipe(ctx, tc, stream)
-		}(tcpConn)
-	}
+	runSupervisedVLESSBondMode(ctx, tp, peer, listenAddr, numSessions)
 }
 
 func enabledText(enabled bool) string {
@@ -2500,23 +2404,27 @@ func maintainVLESSBondPath(ctx context.Context, tp *turnParams, peer *net.UDPAdd
 				return
 			}
 			log.Printf("[bond path %d] setup error: %s, retrying...", id, err)
-			select {
-			case <-ctx.Done():
+			if !waitContextDelay(ctx, vlessBondPathRetryDelay(3*time.Second)) {
 				return
-			case <-time.After(3 * time.Second):
 			}
 			continue
+		}
+		if ctx.Err() != nil {
+			cleanup()
+			return
 		}
 
 		if err := tcputil.WriteBondHello(dtlsConn, bondID); err != nil {
 			log.Printf("[bond path %d] hello error: %s, retrying...", id, err)
 			cleanup()
-			select {
-			case <-ctx.Done():
+			if !waitContextDelay(ctx, vlessBondPathRetryDelay(3*time.Second)) {
 				return
-			case <-time.After(3 * time.Second):
 			}
 			continue
+		}
+		if ctx.Err() != nil {
+			cleanup()
+			return
 		}
 
 		done := bonded.AddConn(dtlsConn, cleanup)
@@ -2524,16 +2432,13 @@ func maintainVLESSBondPath(ctx context.Context, tp *turnParams, peer *net.UDPAdd
 
 		select {
 		case <-ctx.Done():
-			_ = bonded.Close()
 			return
 		case <-done:
 			log.Printf("[bond path %d] disconnected (active: %d), reconnecting...", id, bonded.Count())
 		}
 
-		select {
-		case <-ctx.Done():
+		if !waitContextDelay(ctx, vlessBondPathRetryDelay(2*time.Second)) {
 			return
-		case <-time.After(2 * time.Second):
 		}
 	}
 }

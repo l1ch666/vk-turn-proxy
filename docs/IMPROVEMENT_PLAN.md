@@ -25,7 +25,7 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 
 ## Phase 2: bond correctness
 
-- [ ] Supervise and recreate the complete bond/KCP/smux session after failure.
+- [x] Supervise and recreate the complete bond/KCP/smux session after failure.
 - [ ] Negotiate protocol version, expected path count, MTU, and FEC configuration. (Server V1/V2 parsing and V2 ACK are complete; client rollout/fallback remains.)
 - [ ] Scale the server KCP window from the negotiated path count. (V1 grows dynamically; V2 support is complete, client V2 rollout remains.)
 - [x] Validate all KCP, FEC, MTU, and smux configuration at startup.

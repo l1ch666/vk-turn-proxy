@@ -73,6 +73,39 @@ func TestBondedPacketConnReadsFromAnyPath(t *testing.T) {
 	}
 }
 
+func TestBondedPacketConnNotifiesPathStateChanges(t *testing.T) {
+	pc := NewBondedPacketConn("test-state")
+	defer func() { _ = pc.Close() }()
+
+	left, right := net.Pipe()
+	done := pc.AddConn(left, nil)
+	select {
+	case <-pc.StateChanged():
+	case <-time.After(time.Second):
+		t.Fatal("no notification after adding a path")
+	}
+	if pc.Count() != 1 {
+		t.Fatalf("path count after add = %d, want 1", pc.Count())
+	}
+
+	if err := right.Close(); err != nil {
+		t.Fatalf("close peer path: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("path reader did not stop")
+	}
+	select {
+	case <-pc.StateChanged():
+	case <-time.After(time.Second):
+		t.Fatal("no notification after removing a path")
+	}
+	if pc.Count() != 0 {
+		t.Fatalf("path count after removal = %d, want 0", pc.Count())
+	}
+}
+
 func TestBondHelloRoundTrip(t *testing.T) {
 	t.Parallel()
 

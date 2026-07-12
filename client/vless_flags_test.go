@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/cacggghp/vk-turn-proxy/tcputil"
 )
 
 func TestValidateClientVLESSFlagsRequiresVLESSForBond(t *testing.T) {
@@ -25,6 +27,13 @@ func TestValidateClientVLESSFlagsRejectsNegativeSessionCount(t *testing.T) {
 
 func TestValidateClientVLESSFlagsAllowsAutomaticSessionCount(t *testing.T) {
 	if err := validateClientVLESSFlags(true, false, 0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateClientVLESSFlagsRejectsTooManyBondPaths(t *testing.T) {
+	err := validateClientVLESSFlags(true, true, tcputil.MaxBondPaths+1)
+	if err == nil || !strings.Contains(err.Error(), "must not exceed") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
