@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cacggghp/vk-turn-proxy/metrics"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
@@ -437,6 +438,8 @@ func (g *vlessBondGroup) run(ctx context.Context, onDone func()) {
 			log.Printf("VLESS bond %s: failed to close smux session: %v", g.shortID(), err)
 		}
 	}()
+	metrics.Process.SessionOpened()
+	defer metrics.Process.SessionClosed()
 	log.Printf("smux session established (vless bond server, id=%s)", g.shortID())
 
 	serveSmuxSession(ctx, smuxSess, g.connectAddr)
@@ -576,6 +579,8 @@ func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr s
 			log.Printf("failed to close smux session: %v", err)
 		}
 	}()
+	metrics.Process.SessionOpened()
+	defer metrics.Process.SessionClosed()
 	log.Printf("smux session established (server)")
 
 	serveSmuxSession(ctx, smuxSess, connectAddr)

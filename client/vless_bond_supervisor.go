@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cacggghp/vk-turn-proxy/metrics"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
@@ -265,6 +266,7 @@ func superviseVLESSBond(
 			if ctx.Err() != nil {
 				return
 			}
+			metrics.Process.SessionReconnected()
 			log.Printf("VLESS bond generation setup failed: %s", err)
 			if !waitContextDelay(ctx, retryDelay(attempt)) {
 				return
@@ -274,13 +276,16 @@ func superviseVLESSBond(
 		}
 
 		slot.publish(generation)
+		metrics.Process.SessionOpened()
 		err = generation.wait(ctx)
 		slot.clear(generation)
+		metrics.Process.SessionClosed()
 		lifetime := time.Since(generation.startedAt)
 		generation.close()
 		if ctx.Err() != nil {
 			return
 		}
+		metrics.Process.SessionReconnected()
 		log.Printf("VLESS bond generation %s stopped after %s: %s", shortBondID(generation.id), lifetime.Round(time.Millisecond), err)
 		if lifetime >= vlessBondStableGeneration {
 			attempt = 0

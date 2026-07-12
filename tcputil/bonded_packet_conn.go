@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cacggghp/vk-turn-proxy/metrics"
 )
 
 const (
@@ -129,6 +131,7 @@ func (b *BondedPacketConn) AddConn(conn net.Conn, cleanup func()) <-chan struct{
 	default:
 	}
 	b.paths = append(b.paths, path)
+	metrics.Process.PathOpened()
 	b.mu.Unlock()
 	b.notifyStateChanged()
 
@@ -328,6 +331,7 @@ func (b *BondedPacketConn) removePath(path *bondedPath, closeConn bool) {
 	for i, current := range b.paths {
 		if current == path {
 			b.paths = append(b.paths[:i], b.paths[i+1:]...)
+			metrics.Process.PathClosed()
 			removed = true
 			break
 		}

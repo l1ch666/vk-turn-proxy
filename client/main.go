@@ -34,6 +34,7 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 
 	"github.com/bschaatsbergen/dnsdialer"
+	"github.com/cacggghp/vk-turn-proxy/metrics"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
@@ -715,6 +716,7 @@ func isFatalCaptchaError(err error) bool {
 func recordTURNAllocationResult(streamID int, err error) {
 	if err != nil {
 		if isAuthError(err) {
+			metrics.Process.AuthFailed()
 			handleAuthError(streamID)
 		}
 		return
@@ -2025,6 +2027,7 @@ func main() {
 			case inboundChan <- pkt:
 			default:
 				// Drop the packet only if the global queue is completely full
+				metrics.Process.QueueDropped()
 				packetPool.Put(pkt)
 			}
 		}
@@ -2082,6 +2085,7 @@ type sessionPool struct {
 func (p *sessionPool) add(s *smux.Session) {
 	p.mu.Lock()
 	p.sessions = append(p.sessions, s)
+	metrics.Process.SessionOpened()
 	p.mu.Unlock()
 }
 
@@ -2090,6 +2094,7 @@ func (p *sessionPool) remove(s *smux.Session) {
 	for i, sess := range p.sessions {
 		if sess == s {
 			p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
+			metrics.Process.SessionClosed()
 			break
 		}
 	}
@@ -2396,6 +2401,10 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 
 		pool.remove(smuxSess)
 		cleanup()
+		if ctx.Err() != nil {
+			return
+		}
+		metrics.Process.SessionReconnected()
 		log.Printf("[session %d] disconnected (active: %d), reconnecting...", id, pool.count())
 
 		select {
@@ -2474,6 +2483,10 @@ func maintainVLESSBondPath(
 		case <-ctx.Done():
 			return
 		case <-done:
+			if ctx.Err() != nil {
+				return
+			}
+			metrics.Process.PathReconnected()
 			log.Printf("[bond path %d] disconnected (active: %d), reconnecting...", id, bonded.Count())
 		}
 
