@@ -57,6 +57,8 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 - [ ] Run releases only from commits that passed required CI checks.
 - [ ] Publish checksums, SBOM, provenance, and signed artifacts.
 - [ ] Correct README/module/artifact provenance for this repository.
+  - [x] Use the canonical `github.com/l1ch666/vk-turn-proxy` module path and document the actual build targets and current security status.
+  - [ ] Verify repository-wide licensing and add release automation before declaring published artifact provenance complete.
 - [ ] Harden Docker and systemd execution with non-root users and resource limits.
 
 ## Verification gates

@@ -1,1 +1,6 @@
 dist/
+/bin/
+/benchmarks/results/
+*.exe
+*.test
+*.out
