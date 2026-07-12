@@ -34,25 +34,43 @@ type PathSnapshot struct {
 // Individual atomic fields may advance while a snapshot is being read;
 // counters remain monotonic and gauges reflect a nearby point in time.
 type Snapshot struct {
-	ActivePaths       int64          `json:"active_paths"`
-	ActiveSessions    int64          `json:"active_sessions"`
-	PathReconnects    int64          `json:"path_reconnects"`
-	SessionReconnects int64          `json:"session_reconnects"`
-	AuthFailures      int64          `json:"auth_failures"`
-	QueueDrops        int64          `json:"queue_drops"`
-	Paths             []PathSnapshot `json:"paths"`
+	ActivePaths                  int64          `json:"active_paths"`
+	ActiveSessions               int64          `json:"active_sessions"`
+	PathReconnects               int64          `json:"path_reconnects"`
+	SessionReconnects            int64          `json:"session_reconnects"`
+	AuthFailures                 int64          `json:"auth_failures"`
+	QueueDrops                   int64          `json:"queue_drops"`
+	BytesRead                    uint64         `json:"bytes_read"`
+	BytesWritten                 uint64         `json:"bytes_written"`
+	ReadOperations               uint64         `json:"read_operations"`
+	WriteOperations              uint64         `json:"write_operations"`
+	ReadErrors                   uint64         `json:"read_errors"`
+	WriteErrors                  uint64         `json:"write_errors"`
+	WriteLatencySamples          uint64         `json:"write_latency_samples"`
+	WriteLatencyTotalNanoseconds uint64         `json:"write_latency_total_nanoseconds"`
+	WriteLatencyMaxNanoseconds   uint64         `json:"write_latency_max_nanoseconds"`
+	Paths                        []PathSnapshot `json:"paths"`
 }
 
 // Registry stores process counters and a bounded set of per-path statistics.
 // Its zero value is ready to use.
 type Registry struct {
-	activePaths       atomic.Int64
-	activeSessions    atomic.Int64
-	pathReconnects    atomic.Int64
-	sessionReconnects atomic.Int64
-	authFailures      atomic.Int64
-	queueDrops        atomic.Int64
-	nextPathID        atomic.Uint64
+	activePaths         atomic.Int64
+	activeSessions      atomic.Int64
+	pathReconnects      atomic.Int64
+	sessionReconnects   atomic.Int64
+	authFailures        atomic.Int64
+	queueDrops          atomic.Int64
+	nextPathID          atomic.Uint64
+	bytesRead           atomic.Uint64
+	bytesWritten        atomic.Uint64
+	readOperations      atomic.Uint64
+	writeOperations     atomic.Uint64
+	readErrors          atomic.Uint64
+	writeErrors         atomic.Uint64
+	writeLatencySamples atomic.Uint64
+	writeLatencyTotalNS atomic.Uint64
+	writeLatencyMaxNS   atomic.Uint64
 
 	pathsMu         sync.RWMutex
 	activePathsByID map[uint64]*Path
@@ -136,11 +154,14 @@ func (p *Path) ObserveRead(n int, err error) {
 		return
 	}
 	p.readOperations.Add(1)
+	p.registry.readOperations.Add(1)
 	if n > 0 {
 		p.bytesRead.Add(uint64(n))
+		p.registry.bytesRead.Add(uint64(n))
 	}
 	if err != nil {
 		p.readErrors.Add(1)
+		p.registry.readErrors.Add(1)
 	}
 }
 
@@ -160,11 +181,14 @@ func (p *Path) ObserveWrite(started time.Time, n int, err error) {
 		return
 	}
 	p.writeOperations.Add(1)
+	p.registry.writeOperations.Add(1)
 	if n > 0 {
 		p.bytesWritten.Add(uint64(n))
+		p.registry.bytesWritten.Add(uint64(n))
 	}
 	if err != nil {
 		p.writeErrors.Add(1)
+		p.registry.writeErrors.Add(1)
 	}
 	if !started.IsZero() {
 		p.observeWriteLatency(time.Since(started))
@@ -178,8 +202,15 @@ func (p *Path) observeWriteLatency(elapsed time.Duration) {
 	ns := uint64(elapsed)
 	p.writeLatencySamples.Add(1)
 	p.writeLatencyTotalNS.Add(ns)
-	for current := p.writeLatencyMaxNS.Load(); ns > current; current = p.writeLatencyMaxNS.Load() {
-		if p.writeLatencyMaxNS.CompareAndSwap(current, ns) {
+	p.registry.writeLatencySamples.Add(1)
+	p.registry.writeLatencyTotalNS.Add(ns)
+	updateMaximum(&p.writeLatencyMaxNS, ns)
+	updateMaximum(&p.registry.writeLatencyMaxNS, ns)
+}
+
+func updateMaximum(counter *atomic.Uint64, value uint64) {
+	for current := counter.Load(); value > current; current = counter.Load() {
+		if counter.CompareAndSwap(current, value) {
 			break
 		}
 	}
@@ -220,12 +251,21 @@ func (r *Registry) pathSnapshots() (int64, []PathSnapshot) {
 func (r *Registry) Snapshot() Snapshot {
 	activePaths, paths := r.pathSnapshots()
 	return Snapshot{
-		ActivePaths:       activePaths,
-		ActiveSessions:    r.activeSessions.Load(),
-		PathReconnects:    r.pathReconnects.Load(),
-		SessionReconnects: r.sessionReconnects.Load(),
-		AuthFailures:      r.authFailures.Load(),
-		QueueDrops:        r.queueDrops.Load(),
-		Paths:             paths,
+		ActivePaths:                  activePaths,
+		ActiveSessions:               r.activeSessions.Load(),
+		PathReconnects:               r.pathReconnects.Load(),
+		SessionReconnects:            r.sessionReconnects.Load(),
+		AuthFailures:                 r.authFailures.Load(),
+		QueueDrops:                   r.queueDrops.Load(),
+		BytesRead:                    r.bytesRead.Load(),
+		BytesWritten:                 r.bytesWritten.Load(),
+		ReadOperations:               r.readOperations.Load(),
+		WriteOperations:              r.writeOperations.Load(),
+		ReadErrors:                   r.readErrors.Load(),
+		WriteErrors:                  r.writeErrors.Load(),
+		WriteLatencySamples:          r.writeLatencySamples.Load(),
+		WriteLatencyTotalNanoseconds: r.writeLatencyTotalNS.Load(),
+		WriteLatencyMaxNanoseconds:   r.writeLatencyMaxNS.Load(),
+		Paths:                        paths,
 	}
 }

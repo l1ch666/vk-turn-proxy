@@ -182,6 +182,57 @@ func TestBondedPacketConnRecordsPathTraffic(t *testing.T) {
 	}
 }
 
+type writeStartedConn struct {
+	net.Conn
+	once    sync.Once
+	started chan struct{}
+}
+
+func (c *writeStartedConn) Write(p []byte) (int, error) {
+	c.once.Do(func() { close(c.started) })
+	return c.Conn.Write(p)
+}
+
+func TestBondedPacketConnDoesNotCountWriteErrorDuringClose(t *testing.T) {
+	var registry metrics.Registry
+	pc := NewBondedPacketConn("test-close-metrics")
+	pc.metricRegistry = &registry
+
+	left, right := net.Pipe()
+	defer func() { _ = right.Close() }()
+	conn := &writeStartedConn{Conn: left, started: make(chan struct{})}
+	pc.AddConn(conn, nil)
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := pc.WriteTo([]byte("blocked"), nil)
+		writeDone <- err
+	}()
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		t.Fatal("path write did not start")
+	}
+	if err := pc.Close(); err != nil {
+		t.Fatalf("close bond: %v", err)
+	}
+	select {
+	case err := <-writeDone:
+		if err == nil {
+			t.Fatal("blocked write unexpectedly succeeded during close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked path write did not stop")
+	}
+
+	snapshot := registry.Snapshot()
+	if snapshot.ActivePaths != 0 || snapshot.WriteOperations != 1 || snapshot.WriteErrors != 0 || snapshot.WriteLatencySamples != 0 ||
+		len(snapshot.Paths) != 1 || snapshot.Paths[0].WriteOperations != 1 || snapshot.Paths[0].WriteErrors != 0 ||
+		snapshot.Paths[0].WriteLatencySamples != 0 {
+		t.Fatalf("close-induced write polluted error metrics: %+v", snapshot)
+	}
+}
+
 func TestBondHelloRoundTrip(t *testing.T) {
 	t.Parallel()
 

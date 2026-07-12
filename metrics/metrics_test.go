@@ -90,6 +90,14 @@ func TestPathRecordsTrafficErrorsAndLatency(t *testing.T) {
 		got.WriteLatencyMaxNanoseconds != uint64(5*time.Millisecond) {
 		t.Fatalf("path snapshot = %+v", got)
 	}
+	if snapshot.BytesRead != got.BytesRead || snapshot.BytesWritten != got.BytesWritten ||
+		snapshot.ReadOperations != got.ReadOperations || snapshot.WriteOperations != got.WriteOperations ||
+		snapshot.ReadErrors != got.ReadErrors || snapshot.WriteErrors != got.WriteErrors ||
+		snapshot.WriteLatencySamples != got.WriteLatencySamples ||
+		snapshot.WriteLatencyTotalNanoseconds != got.WriteLatencyTotalNanoseconds ||
+		snapshot.WriteLatencyMaxNanoseconds != got.WriteLatencyMaxNanoseconds {
+		t.Fatalf("process traffic totals = %+v, want retained path totals %+v", snapshot, got)
+	}
 }
 
 func TestPathWriteLatencySamplingRate(t *testing.T) {
@@ -111,14 +119,25 @@ func TestPathWriteLatencySamplingRate(t *testing.T) {
 func TestRegistryBoundsRecentPathHistory(t *testing.T) {
 	var registry Registry
 	for i := 0; i < recentPathLimit+10; i++ {
-		registry.OpenPath("bond/path").Close()
+		path := registry.OpenPath("bond/path")
+		path.ObserveRead(1, nil)
+		path.ObserveWrite(time.Time{}, 2, errors.New("write failed"))
+		path.observeWriteLatency(time.Nanosecond)
+		path.Close()
 	}
 
 	snapshot := registry.Snapshot()
+	totalPaths := uint64(recentPathLimit + 10)
 	if snapshot.ActivePaths != 0 || len(snapshot.Paths) != recentPathLimit {
 		t.Fatalf("snapshot has %d active and %d retained paths, want 0 and %d", snapshot.ActivePaths, len(snapshot.Paths), recentPathLimit)
 	}
 	if snapshot.Paths[0].ID != 11 || snapshot.Paths[len(snapshot.Paths)-1].ID != recentPathLimit+10 {
 		t.Fatalf("retained path IDs = %d..%d, want 11..%d", snapshot.Paths[0].ID, snapshot.Paths[len(snapshot.Paths)-1].ID, recentPathLimit+10)
+	}
+	if snapshot.BytesRead != totalPaths || snapshot.BytesWritten != totalPaths*2 ||
+		snapshot.ReadOperations != totalPaths || snapshot.WriteOperations != totalPaths ||
+		snapshot.WriteErrors != totalPaths || snapshot.WriteLatencySamples != totalPaths ||
+		snapshot.WriteLatencyTotalNanoseconds != totalPaths || snapshot.WriteLatencyMaxNanoseconds != 1 {
+		t.Fatalf("process traffic totals lost evicted paths: %+v", snapshot)
 	}
 }

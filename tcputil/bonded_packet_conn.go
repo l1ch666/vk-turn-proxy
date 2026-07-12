@@ -195,7 +195,12 @@ func (b *BondedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		if err == nil && n != len(p) {
 			err = ioShortWrite(n, len(p))
 		}
-		path.stats.ObserveWrite(started, n, err)
+		metricErr := err
+		if path.closing.Load() {
+			metricErr = nil
+			started = time.Time{}
+		}
+		path.stats.ObserveWrite(started, n, metricErr)
 		if err == nil {
 			return n, nil
 		}
