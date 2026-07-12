@@ -69,6 +69,21 @@ paths; process byte, operation, error, and latency totals are not discarded
 when a path leaves that history. Write latency is sampled once every 64 physical
 path writes to keep hot-path overhead bounded.
 
+The nested `kcp` object is a process-wide snapshot from `kcp-go`; the library
+does not expose these counters per session. `retransmitted_segments` is the
+library's cumulative total of timeout/lost, fast, and early retransmissions.
+`lost_segments` is an inferred retransmission event count, not a direct network
+packet-loss percentage. Upstream counts `input_bytes` after removing its
+crypto/CRC header but counts `output_bytes` from the actual datagram write, so
+the two fields are not symmetric wire-overhead measurements.
+
+FEC counters report received parity shards and recovered data packets.
+`fec_reported_errors` combines encoder failures with malformed recovered
+payloads; it does not include every Reed-Solomon reconstruction failure.
+`fec_short_shards` counts data-shard eviction caused by the bounded receive
+queue, but not timeout expiry. All KCP totals survive session rebuilds and reset
+only when the process restarts.
+
 Example requests:
 
 ```sh

@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/xtaci/kcp-go/v5"
 )
 
 const (
@@ -30,6 +32,36 @@ type PathSnapshot struct {
 	WriteLatencyMaxNanoseconds   uint64 `json:"write_latency_max_nanoseconds"`
 }
 
+// KCPSnapshot contains the process-wide counters exported by kcp-go. The
+// dependency does not expose retransmission or FEC counters per session, so
+// these values aggregate every KCP session in this process.
+type KCPSnapshot struct {
+	ApplicationBytesSent       uint64 `json:"application_bytes_sent"`
+	ApplicationBytesReceived   uint64 `json:"application_bytes_received"`
+	CurrentSessions            uint64 `json:"current_sessions"`
+	MaximumSessions            uint64 `json:"maximum_sessions"`
+	ActiveOpens                uint64 `json:"active_opens"`
+	PassiveOpens               uint64 `json:"passive_opens"`
+	InputErrors                uint64 `json:"input_errors"`
+	ChecksumErrors             uint64 `json:"checksum_errors"`
+	ProtocolInputErrors        uint64 `json:"protocol_input_errors"`
+	PacketsReceived            uint64 `json:"packets_received"`
+	PacketsSent                uint64 `json:"packets_sent"`
+	SegmentsReceived           uint64 `json:"segments_received"`
+	SegmentsSent               uint64 `json:"segments_sent"`
+	InputBytes                 uint64 `json:"input_bytes"`
+	OutputBytes                uint64 `json:"output_bytes"`
+	RetransmittedSegments      uint64 `json:"retransmitted_segments"`
+	FastRetransmittedSegments  uint64 `json:"fast_retransmitted_segments"`
+	EarlyRetransmittedSegments uint64 `json:"early_retransmitted_segments"`
+	LostSegments               uint64 `json:"lost_segments"`
+	RepeatedSegments           uint64 `json:"repeated_segments"`
+	FECRecoveredPackets        uint64 `json:"fec_recovered_packets"`
+	FECReportedErrors          uint64 `json:"fec_reported_errors"`
+	FECParityShardsReceived    uint64 `json:"fec_parity_shards_received"`
+	FECShortShards             uint64 `json:"fec_short_shards"`
+}
+
 // Snapshot is a consistent-enough view of process transport metrics.
 // Individual atomic fields may advance while a snapshot is being read;
 // counters remain monotonic and gauges reflect a nearby point in time.
@@ -49,6 +81,7 @@ type Snapshot struct {
 	WriteLatencySamples          uint64         `json:"write_latency_samples"`
 	WriteLatencyTotalNanoseconds uint64         `json:"write_latency_total_nanoseconds"`
 	WriteLatencyMaxNanoseconds   uint64         `json:"write_latency_max_nanoseconds"`
+	KCP                          KCPSnapshot    `json:"kcp"`
 	Paths                        []PathSnapshot `json:"paths"`
 }
 
@@ -71,6 +104,7 @@ type Registry struct {
 	writeLatencySamples atomic.Uint64
 	writeLatencyTotalNS atomic.Uint64
 	writeLatencyMaxNS   atomic.Uint64
+	kcpSNMP             *kcp.Snmp
 
 	pathsMu         sync.RWMutex
 	activePathsByID map[uint64]*Path
@@ -96,8 +130,10 @@ type Path struct {
 	writeLatencyMaxNS   atomic.Uint64
 }
 
-// Process is the registry used by the client and server binaries.
-var Process Registry
+// Process is the registry used by the client and server binaries. KCP's
+// process-wide SNMP collector is attached only here so zero-value registries
+// remain isolated in tests and other callers.
+var Process = Registry{kcpSNMP: kcp.DefaultSnmp}
 
 // OpenPath starts accounting for a physical bonded transport path.
 func (r *Registry) OpenPath(label string) *Path {
@@ -266,6 +302,40 @@ func (r *Registry) Snapshot() Snapshot {
 		WriteLatencySamples:          r.writeLatencySamples.Load(),
 		WriteLatencyTotalNanoseconds: r.writeLatencyTotalNS.Load(),
 		WriteLatencyMaxNanoseconds:   r.writeLatencyMaxNS.Load(),
+		KCP:                          snapshotKCP(r.kcpSNMP),
 		Paths:                        paths,
+	}
+}
+
+func snapshotKCP(source *kcp.Snmp) KCPSnapshot {
+	if source == nil {
+		return KCPSnapshot{}
+	}
+	stats := source.Copy()
+	return KCPSnapshot{
+		ApplicationBytesSent:       stats.BytesSent,
+		ApplicationBytesReceived:   stats.BytesReceived,
+		CurrentSessions:            stats.CurrEstab,
+		MaximumSessions:            stats.MaxConn,
+		ActiveOpens:                stats.ActiveOpens,
+		PassiveOpens:               stats.PassiveOpens,
+		InputErrors:                stats.InErrs,
+		ChecksumErrors:             stats.InCsumErrors,
+		ProtocolInputErrors:        stats.KCPInErrors,
+		PacketsReceived:            stats.InPkts,
+		PacketsSent:                stats.OutPkts,
+		SegmentsReceived:           stats.InSegs,
+		SegmentsSent:               stats.OutSegs,
+		InputBytes:                 stats.InBytes,
+		OutputBytes:                stats.OutBytes,
+		RetransmittedSegments:      stats.RetransSegs,
+		FastRetransmittedSegments:  stats.FastRetransSegs,
+		EarlyRetransmittedSegments: stats.EarlyRetransSegs,
+		LostSegments:               stats.LostSegs,
+		RepeatedSegments:           stats.RepeatSegs,
+		FECRecoveredPackets:        stats.FECRecovered,
+		FECReportedErrors:          stats.FECErrs,
+		FECParityShardsReceived:    stats.FECParityShards,
+		FECShortShards:             stats.FECShortShards,
 	}
 }
