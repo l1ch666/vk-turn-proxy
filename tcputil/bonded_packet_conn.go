@@ -6,13 +6,34 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const bondHelloPrefix = "VKTURNBOND/1 "
+const (
+	bondHelloV1Token = "VKTURNBOND/1"
+	bondHelloV2Token = "VKTURNBOND/2"
+	bondHelloV2Ack   = "VKTURNBOND/2 OK\n"
+	maxBondHelloSize = 256
+	MaxBondPaths     = 64
+	BondProtocolV1   = 1
+	BondProtocolV2   = 2
+)
+
+// BondHello is the per-path control record sent before KCP traffic. V1 carries
+// only a bond ID. V2 also carries the wire-critical KCP profile and is confirmed
+// by the server before either side starts KCP.
+type BondHello struct {
+	Version         int
+	BondID          string
+	ExpectedPaths   int
+	MTU             int
+	FECDataShards   int
+	FECParityShards int
+}
 
 type bondAddr string
 
@@ -309,17 +330,50 @@ func ioShortWrite(n, want int) error {
 }
 
 func WriteBondHello(conn net.Conn, bondID string) error {
-	if !isValidBondID(bondID) {
-		return fmt.Errorf("invalid vless bond id")
+	return WriteBondHelloConfig(conn, BondHello{Version: BondProtocolV1, BondID: bondID})
+}
+
+// CurrentBondHello returns a V2 hello with the active wire-critical KCP profile.
+func CurrentBondHello(bondID string, expectedPaths int) BondHello {
+	dataShards, parityShards := FECShards()
+	return BondHello{
+		Version:         BondProtocolV2,
+		BondID:          bondID,
+		ExpectedPaths:   expectedPaths,
+		MTU:             KCPMtu,
+		FECDataShards:   dataShards,
+		FECParityShards: parityShards,
 	}
-	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+}
+
+// WriteBondHelloConfig writes one standalone DTLS control record. KCP traffic
+// must not be coalesced into the same record.
+func WriteBondHelloConfig(conn net.Conn, hello BondHello) error {
+	if err := validateBondHello(hello); err != nil {
 		return err
 	}
-	_, err := conn.Write([]byte(bondHelloPrefix + bondID + "\n"))
-	if resetErr := conn.SetWriteDeadline(time.Time{}); err == nil {
-		err = resetErr
+	var line string
+	switch hello.Version {
+	case BondProtocolV1:
+		line = fmt.Sprintf("%s %s\n", bondHelloV1Token, hello.BondID)
+	case BondProtocolV2:
+		line = fmt.Sprintf("%s %s %d %d %d %d\n",
+			bondHelloV2Token,
+			hello.BondID,
+			hello.ExpectedPaths,
+			hello.MTU,
+			hello.FECDataShards,
+			hello.FECParityShards,
+		)
+	default:
+		return fmt.Errorf("unsupported vless bond protocol version %d", hello.Version)
 	}
-	return err
+	return writeBondControlLine(conn, line)
+}
+
+// WriteBondHelloAck confirms that the server accepted a V2 profile.
+func WriteBondHelloAck(conn net.Conn) error {
+	return writeBondControlLine(conn, bondHelloV2Ack)
 }
 
 // ReadBondHello reads the bond hello line. It relies on DTLS datagram framing:
@@ -327,26 +381,158 @@ func WriteBondHello(conn net.Conn, bondID string) error {
 // the first read returns exactly the hello line and no subsequent KCP data is
 // consumed/lost. Do NOT coalesce the hello with other writes on the client side.
 func ReadBondHello(conn net.Conn) (string, error) {
-	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	hello, err := ReadBondHelloConfig(conn)
+	if err != nil {
 		return "", err
 	}
-	line, err := bufio.NewReader(conn).ReadString('\n')
+	return hello.BondID, nil
+}
+
+// ReadBondHelloConfig accepts both the legacy V1 record and the V2 profile.
+func ReadBondHelloConfig(conn net.Conn) (BondHello, error) {
+	line, err := readBondControlLine(conn, 10*time.Second)
+	if err != nil {
+		return BondHello{}, err
+	}
+	return parseBondHelloLine(line)
+}
+
+// ReadBondHelloAck waits for the server to confirm a V2 profile.
+func ReadBondHelloAck(conn net.Conn) error {
+	line, err := readBondControlLine(conn, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if line != strings.TrimSpace(bondHelloV2Ack) {
+		return fmt.Errorf("unexpected vless bond V2 acknowledgement %q", line)
+	}
+	return nil
+}
+
+// ValidateBondHelloTuning checks that a received V2 wire profile matches the
+// server's local MTU/FEC settings. V1 has no profile and remains accepted.
+func ValidateBondHelloTuning(hello BondHello) error {
+	if err := validateBondHello(hello); err != nil {
+		return err
+	}
+	if hello.Version == BondProtocolV1 {
+		return nil
+	}
+	dataShards, parityShards := FECShards()
+	if hello.MTU != KCPMtu {
+		return fmt.Errorf("vless bond KCP MTU mismatch: client=%d server=%d", hello.MTU, KCPMtu)
+	}
+	if hello.FECDataShards != dataShards || hello.FECParityShards != parityShards {
+		return fmt.Errorf("vless bond FEC mismatch: client=%d:%d server=%d:%d",
+			hello.FECDataShards,
+			hello.FECParityShards,
+			dataShards,
+			parityShards,
+		)
+	}
+	return nil
+}
+
+func parseBondHelloLine(line string) (BondHello, error) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return BondHello{}, errors.New("missing vless bond hello")
+	}
+	switch fields[0] {
+	case bondHelloV1Token:
+		if len(fields) != 2 {
+			return BondHello{}, fmt.Errorf("invalid vless bond V1 hello field count")
+		}
+		hello := BondHello{Version: BondProtocolV1, BondID: fields[1]}
+		return hello, validateBondHello(hello)
+	case bondHelloV2Token:
+		if len(fields) != 6 {
+			return BondHello{}, fmt.Errorf("invalid vless bond V2 hello field count")
+		}
+		values := make([]int, 4)
+		for i, raw := range fields[2:] {
+			value, err := strconv.Atoi(raw)
+			if err != nil {
+				return BondHello{}, fmt.Errorf("invalid vless bond V2 numeric field %q: %w", raw, err)
+			}
+			values[i] = value
+		}
+		hello := BondHello{
+			Version:         BondProtocolV2,
+			BondID:          fields[1],
+			ExpectedPaths:   values[0],
+			MTU:             values[1],
+			FECDataShards:   values[2],
+			FECParityShards: values[3],
+		}
+		return hello, validateBondHello(hello)
+	default:
+		return BondHello{}, fmt.Errorf("unsupported vless bond protocol %q", fields[0])
+	}
+}
+
+func validateBondHello(hello BondHello) error {
+	if !isValidBondID(hello.BondID) {
+		return fmt.Errorf("invalid vless bond id")
+	}
+	switch hello.Version {
+	case BondProtocolV1:
+		if hello.ExpectedPaths != 0 || hello.MTU != 0 || hello.FECDataShards != 0 || hello.FECParityShards != 0 {
+			return fmt.Errorf("vless bond V1 hello must not contain a transport profile")
+		}
+	case BondProtocolV2:
+		if hello.ExpectedPaths < 1 || hello.ExpectedPaths > MaxBondPaths {
+			return fmt.Errorf("vless bond expected paths must be in 1..%d", MaxBondPaths)
+		}
+		if err := validateFECShards(hello.FECDataShards, hello.FECParityShards); err != nil {
+			return fmt.Errorf("invalid vless bond FEC profile: %w", err)
+		}
+		maxMTU := maxKCPMTU(hello.FECDataShards, hello.FECParityShards)
+		if hello.MTU < minKCPMTU || hello.MTU > maxMTU {
+			return fmt.Errorf("vless bond KCP MTU must be in %d..%d", minKCPMTU, maxMTU)
+		}
+	default:
+		return fmt.Errorf("unsupported vless bond protocol version %d", hello.Version)
+	}
+	return nil
+}
+
+func writeBondControlLine(conn net.Conn, line string) error {
+	if len(line) > maxBondHelloSize || !strings.HasSuffix(line, "\n") {
+		return fmt.Errorf("invalid vless bond control record length")
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	n, err := conn.Write([]byte(line))
+	if err == nil && n != len(line) {
+		err = ioShortWrite(n, len(line))
+	}
+	if resetErr := conn.SetWriteDeadline(time.Time{}); err == nil {
+		err = resetErr
+	}
+	return err
+}
+
+func readBondControlLine(conn net.Conn, timeout time.Duration) (string, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return "", err
+	}
+	reader := bufio.NewReaderSize(io.LimitReader(conn, maxBondHelloSize+1), maxBondHelloSize+1)
+	line, err := reader.ReadString('\n')
 	if resetErr := conn.SetReadDeadline(time.Time{}); err == nil {
 		err = resetErr
+	}
+	if len(line) > maxBondHelloSize {
+		return "", fmt.Errorf("vless bond control record exceeds %d bytes", maxBondHelloSize)
 	}
 	if err != nil {
 		return "", err
 	}
-
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, bondHelloPrefix) {
-		return "", errors.New("missing vless bond hello")
+	if !strings.HasSuffix(line, "\n") {
+		return "", fmt.Errorf("unterminated vless bond control record")
 	}
-	bondID := strings.TrimPrefix(line, bondHelloPrefix)
-	if !isValidBondID(bondID) {
-		return "", fmt.Errorf("invalid vless bond id")
-	}
-	return bondID, nil
+	return strings.TrimSpace(line), nil
 }
 
 func isValidBondID(value string) bool {

@@ -241,11 +241,91 @@ func TestVLESSBondGroupGrowsKCPWindowForNewPaths(t *testing.T) {
 		_ = peer1.Close()
 		_ = peer2.Close()
 	})
-	group.add(path1)
-	group.add(path2)
+	if err := group.add(path1); err != nil {
+		t.Fatalf("first path rejected: %v", err)
+	}
+	if err := group.add(path2); err != nil {
+		t.Fatalf("second path rejected: %v", err)
+	}
 
 	want := tcputil.BondedKCPWindow(2)
 	if got := recorder.last(); got != want {
 		t.Fatalf("KCP window after two paths = %d, want %d", got, want)
 	}
+}
+
+func TestVLESSBondGroupUsesNegotiatedPathCount(t *testing.T) {
+	hello := tcputil.CurrentBondHello("0123456789abcdef", 10)
+	group := &vlessBondGroup{
+		id:          hello.BondID,
+		connectAddr: "127.0.0.1:1",
+		pc:          tcputil.NewBondedPacketConn("test-negotiated-window"),
+		hello:       hello,
+	}
+	t.Cleanup(func() { _ = group.pc.Close() })
+
+	recorder := &recordingKCPWindow{}
+	pathCount, window := group.installWindowSetter(recorder)
+	if pathCount != 10 {
+		t.Fatalf("negotiated path count = %d, want 10", pathCount)
+	}
+	if want := tcputil.BondedKCPWindow(10); window != want || recorder.last() != want {
+		t.Fatalf("negotiated window = %d/%d, want %d", window, recorder.last(), want)
+	}
+}
+
+func TestVLESSBondGroupRejectsExtraNegotiatedPath(t *testing.T) {
+	hello := tcputil.CurrentBondHello("0123456789abcdef", 1)
+	group := &vlessBondGroup{
+		id:          hello.BondID,
+		connectAddr: "127.0.0.1:1",
+		pc:          tcputil.NewBondedPacketConn("test-path-limit"),
+		hello:       hello,
+	}
+	t.Cleanup(func() { _ = group.pc.Close() })
+
+	path1, peer1 := net.Pipe()
+	path2, peer2 := net.Pipe()
+	t.Cleanup(func() {
+		_ = peer1.Close()
+		_ = peer2.Close()
+		_ = path2.Close()
+	})
+	if err := group.add(path1); err != nil {
+		t.Fatalf("first path rejected: %v", err)
+	}
+	if err := group.add(path2); err == nil {
+		t.Fatal("extra negotiated path unexpectedly accepted")
+	}
+}
+
+func TestVLESSBondManagerAcceptsV2AndAcknowledges(t *testing.T) {
+	manager := newVLESSBondManager("127.0.0.1:1")
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+
+	hello := tcputil.CurrentBondHello("0123456789abcdef", 2)
+	clientDone := make(chan error, 1)
+	go func() {
+		if err := tcputil.WriteBondHelloConfig(clientConn, hello); err != nil {
+			clientDone <- err
+			return
+		}
+		clientDone <- tcputil.ReadBondHelloAck(clientConn)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := manager.Add(ctx, serverConn); err != nil {
+		cancel()
+		t.Fatalf("V2 path rejected: %v", err)
+	}
+	if err := <-clientDone; err != nil {
+		cancel()
+		t.Fatalf("V2 client handshake failed: %v", err)
+	}
+	cancel()
+	manager.Wait()
 }

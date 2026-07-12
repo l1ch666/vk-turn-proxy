@@ -234,38 +234,61 @@ func newVLESSBondManager(connectAddr string) *vlessBondManager {
 }
 
 func (m *vlessBondManager) Add(ctx context.Context, conn net.Conn) error {
-	bondID, err := tcputil.ReadBondHello(conn)
+	hello, err := tcputil.ReadBondHelloConfig(conn)
 	if err != nil {
 		return err
+	}
+	if err := tcputil.ValidateBondHelloTuning(hello); err != nil {
+		return err
+	}
+	bondID := hello.BondID
+	m.mu.Lock()
+	existing := m.groups[bondID]
+	if existing != nil && !existing.matchesHello(hello) {
+		m.mu.Unlock()
+		return fmt.Errorf("vless bond %s path profile does not match the existing group", existing.shortID())
+	}
+	m.mu.Unlock()
+	if hello.Version == tcputil.BondProtocolV2 {
+		if err := tcputil.WriteBondHelloAck(conn); err != nil {
+			return fmt.Errorf("write vless bond V2 acknowledgement: %w", err)
+		}
 	}
 
 	m.mu.Lock()
 	group := m.groups[bondID]
-	isNew := group == nil
 	if group == nil {
 		group = &vlessBondGroup{
 			id:          bondID,
 			connectAddr: m.connectAddr,
 			pc:          tcputil.NewBondedPacketConn("vless-bond-server:" + bondID),
+			hello:       hello,
 		}
 		m.groups[bondID] = group
-		m.wg.Add(1)
+	} else if !group.matchesHello(hello) {
+		m.mu.Unlock()
+		return fmt.Errorf("vless bond %s path profile does not match the existing group", group.shortID())
 	}
 	m.mu.Unlock()
 
 	// The first path must be visible before run starts, otherwise the server
 	// sizes KCP from an empty bond and remains capped at a single-path window.
-	group.add(conn)
-	if isNew {
+	if err := group.add(conn); err != nil {
+		return err
+	}
+	group.startOnce.Do(func() {
+		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
 			m.runGroup(ctx, group, func() {
 				m.mu.Lock()
-				delete(m.groups, bondID)
+				if m.groups[bondID] == group {
+					delete(m.groups, bondID)
+				}
 				m.mu.Unlock()
 			})
 		}()
-	}
+	})
 	return nil
 }
 
@@ -277,37 +300,60 @@ type vlessBondGroup struct {
 	id          string
 	connectAddr string
 	pc          *tcputil.BondedPacketConn
+	hello       tcputil.BondHello
+	startOnce   sync.Once
 	mu          sync.Mutex
 	maxPaths    int
 	window      kcpWindowSetter
+	appliedWnd  int
 }
 
 type kcpWindowSetter interface {
 	SetWindowSize(int, int)
 }
 
-func (g *vlessBondGroup) add(conn net.Conn) {
-	g.pc.AddConn(conn, nil)
-	active := g.pc.Count()
-	resized, window := g.observePathCount(active)
-	log.Printf("VLESS bond %s: path connected (active: %d)", g.shortID(), active)
-	if resized {
-		log.Printf("VLESS bond %s: KCP window increased to %d for %d paths", g.shortID(), window, active)
-	}
+func (g *vlessBondGroup) matchesHello(hello tcputil.BondHello) bool {
+	return g.hello == hello
 }
 
-func (g *vlessBondGroup) observePathCount(pathCount int) (bool, int) {
+func (g *vlessBondGroup) add(conn net.Conn) error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	if pathCount <= g.maxPaths {
-		return false, tcputil.BondedKCPWindow(g.maxPaths)
+	if g.hello.Version == tcputil.BondProtocolV2 && g.pc.Count() >= g.hello.ExpectedPaths {
+		g.mu.Unlock()
+		return fmt.Errorf("vless bond %s already has its negotiated %d paths", g.shortID(), g.hello.ExpectedPaths)
 	}
-	g.maxPaths = pathCount
-	window := tcputil.BondedKCPWindow(g.maxPaths)
-	if g.window == nil {
+	g.pc.AddConn(conn, nil)
+	active := g.pc.Count()
+	if active > g.maxPaths {
+		g.maxPaths = active
+	}
+	resized, window := g.applyWindowLocked()
+	g.mu.Unlock()
+
+	log.Printf("VLESS bond %s: path connected (active: %d)", g.shortID(), active)
+	if resized {
+		log.Printf("VLESS bond %s: KCP window increased to %d", g.shortID(), window)
+	}
+	return nil
+}
+
+func (g *vlessBondGroup) desiredPathCountLocked() int {
+	if g.hello.Version == tcputil.BondProtocolV2 && g.hello.ExpectedPaths > 0 {
+		return g.hello.ExpectedPaths
+	}
+	if g.maxPaths < 1 {
+		return 1
+	}
+	return g.maxPaths
+}
+
+func (g *vlessBondGroup) applyWindowLocked() (bool, int) {
+	window := tcputil.BondedKCPWindow(g.desiredPathCountLocked())
+	if g.window == nil || window <= g.appliedWnd {
 		return false, window
 	}
 	g.window.SetWindowSize(window, window)
+	g.appliedWnd = window
 	return true, window
 }
 
@@ -315,12 +361,11 @@ func (g *vlessBondGroup) installWindowSetter(setter kcpWindowSetter) (int, int) 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.window = setter
-	pathCount := g.maxPaths
-	if pathCount < 1 {
-		pathCount = 1
-	}
+	g.appliedWnd = 0
+	pathCount := g.desiredPathCountLocked()
 	window := tcputil.BondedKCPWindow(pathCount)
 	setter.SetWindowSize(window, window)
+	g.appliedWnd = window
 	return pathCount, window
 }
 
@@ -329,16 +374,14 @@ func (g *vlessBondGroup) clearWindowSetter(setter kcpWindowSetter) {
 	defer g.mu.Unlock()
 	if g.window == setter {
 		g.window = nil
+		g.appliedWnd = 0
 	}
 }
 
-func (g *vlessBondGroup) maximumPathCount() int {
+func (g *vlessBondGroup) desiredPathCount() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.maxPaths < 1 {
-		return 1
-	}
-	return g.maxPaths
+	return g.desiredPathCountLocked()
 }
 
 func (g *vlessBondGroup) run(ctx context.Context, onDone func()) {
@@ -358,7 +401,7 @@ func (g *vlessBondGroup) run(ctx context.Context, onDone func()) {
 	// Scale the receive/send window for the aggregate of bonded paths. Window
 	// sizes need not match the peer exactly (unlike FEC), so we size from the
 	// paths connected so far (with a floor) — more paths may still join after.
-	pathCount := g.maximumPathCount()
+	pathCount := g.desiredPathCount()
 	kcpSess, err := tcputil.NewKCPOverPacketConnBonded(g.pc, g.pc.RemoteAddr(), true, pathCount)
 	if err != nil {
 		log.Printf("VLESS bond %s: KCP session error: %s", g.shortID(), err)

@@ -101,10 +101,31 @@ func parseFEC(v string) (int, int, error) {
 	if d <= 0 || p <= 0 {
 		return 0, 0, fmt.Errorf("data and parity shards must both be positive, or both zero")
 	}
-	if d > 256 || p > 256 || d > 256-p {
-		return 0, 0, fmt.Errorf("data and parity shards must total at most 256")
+	if err := validateFECShards(d, p); err != nil {
+		return 0, 0, err
 	}
 	return d, p, nil
+}
+
+func validateFECShards(dataShards, parityShards int) error {
+	if dataShards == 0 && parityShards == 0 {
+		return nil
+	}
+	if dataShards <= 0 || parityShards <= 0 {
+		return fmt.Errorf("data and parity shards must both be positive, or both zero")
+	}
+	if dataShards > 256 || parityShards > 256 || dataShards > 256-parityShards {
+		return fmt.Errorf("data and parity shards must total at most 256")
+	}
+	return nil
+}
+
+func maxKCPMTU(dataShards, parityShards int) int {
+	maxMTU := kcpXmitBufferSize - kcpCryptHeaderSize
+	if dataShards > 0 && parityShards > 0 {
+		maxMTU -= kcpFECHeaderSize
+	}
+	return maxMTU
 }
 
 // FECShards returns the configured Reed-Solomon (dataShards, parityShards).
@@ -191,15 +212,10 @@ func validateTuning(v tuningValues) error {
 	if v.nc != 0 && v.nc != 1 {
 		errs = append(errs, fmt.Errorf("kcp-nc must be 0 or 1"))
 	}
-	if v.dataShards < 0 || v.parityShards < 0 ||
-		(v.dataShards == 0) != (v.parityShards == 0) ||
-		(v.dataShards > 0 && (v.dataShards > 256 || v.parityShards > 256 || v.dataShards > 256-v.parityShards)) {
-		errs = append(errs, fmt.Errorf("kcp-fec must be 0:0 or positive data:parity totaling at most 256"))
+	if err := validateFECShards(v.dataShards, v.parityShards); err != nil {
+		errs = append(errs, fmt.Errorf("kcp-fec: %w", err))
 	}
-	maxMTU := kcpXmitBufferSize - kcpCryptHeaderSize
-	if v.dataShards > 0 && v.parityShards > 0 {
-		maxMTU -= kcpFECHeaderSize
-	}
+	maxMTU := maxKCPMTU(v.dataShards, v.parityShards)
 	if v.mtu < minKCPMTU || v.mtu > maxMTU {
 		errs = append(errs, fmt.Errorf("kcp-mtu must be in %d..%d for the selected FEC profile", minKCPMTU, maxMTU))
 	}

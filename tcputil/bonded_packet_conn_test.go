@@ -3,6 +3,7 @@ package tcputil
 import (
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,6 +94,133 @@ func TestBondHelloRoundTrip(t *testing.T) {
 	}
 	if got != "0123456789abcdef" {
 		t.Fatalf("bond id = %q, want 0123456789abcdef", got)
+	}
+}
+
+func TestBondHelloV1WireFormatRemainsCompatible(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	const want = "VKTURNBOND/1 0123456789abcdef\n"
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- WriteBondHello(clientConn, "0123456789abcdef") }()
+	buf := make([]byte, len(want))
+	if _, err := io.ReadFull(serverConn, buf); err != nil {
+		t.Fatalf("read V1 wire record: %v", err)
+	}
+	if got := string(buf); got != want {
+		t.Fatalf("V1 wire record = %q, want %q", got, want)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write V1 wire record: %v", err)
+	}
+}
+
+func TestBondHelloV2RoundTripAndAck(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	want := BondHello{
+		Version:         BondProtocolV2,
+		BondID:          "0123456789abcdef",
+		ExpectedPaths:   10,
+		MTU:             1200,
+		FECDataShards:   10,
+		FECParityShards: 3,
+	}
+	clientDone := make(chan error, 1)
+	go func() {
+		if err := WriteBondHelloConfig(clientConn, want); err != nil {
+			clientDone <- err
+			return
+		}
+		clientDone <- ReadBondHelloAck(clientConn)
+	}()
+
+	got, err := ReadBondHelloConfig(serverConn)
+	if err != nil {
+		t.Fatalf("ReadBondHelloConfig failed: %v", err)
+	}
+	if got != want {
+		t.Fatalf("V2 hello = %+v, want %+v", got, want)
+	}
+	if err := WriteBondHelloAck(serverConn); err != nil {
+		t.Fatalf("WriteBondHelloAck failed: %v", err)
+	}
+	if err := <-clientDone; err != nil {
+		t.Fatalf("client handshake failed: %v", err)
+	}
+}
+
+func TestParseBondHelloLineRejectsInvalidProfiles(t *testing.T) {
+	id := "0123456789abcdef"
+	invalid := []string{
+		"",
+		"VKTURNBOND/3 " + id,
+		"VKTURNBOND/1 " + id + " extra",
+		"VKTURNBOND/2 " + id + " 1 1200 0",
+		"VKTURNBOND/2 " + id + " zero 1200 0 0",
+		"VKTURNBOND/2 " + id + " 0 1200 0 0",
+		"VKTURNBOND/2 " + id + " 65 1200 0 0",
+		"VKTURNBOND/2 " + id + " 1 1481 0 0",
+		"VKTURNBOND/2 " + id + " 1 1200 10 0",
+		"VKTURNBOND/2 " + id + " 1 1200 255 2",
+	}
+	for _, line := range invalid {
+		if _, err := parseBondHelloLine(line); err == nil {
+			t.Errorf("parseBondHelloLine(%q) unexpectedly succeeded", line)
+		}
+	}
+}
+
+func TestReadBondHelloRejectsOversizedRecord(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write([]byte(strings.Repeat("x", maxBondHelloSize) + "\n"))
+		writeDone <- err
+	}()
+	if _, err := ReadBondHelloConfig(serverConn); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized hello error = %v, want size error", err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write oversized hello: %v", err)
+	}
+}
+
+func TestValidateBondHelloTuning(t *testing.T) {
+	hello := CurrentBondHello("0123456789abcdef", 4)
+	if err := ValidateBondHelloTuning(hello); err != nil {
+		t.Fatalf("current profile rejected: %v", err)
+	}
+
+	mismatchedMTU := hello
+	if mismatchedMTU.MTU > minKCPMTU {
+		mismatchedMTU.MTU--
+	} else {
+		mismatchedMTU.MTU++
+	}
+	if err := ValidateBondHelloTuning(mismatchedMTU); err == nil || !strings.Contains(err.Error(), "MTU mismatch") {
+		t.Fatalf("MTU mismatch error = %v", err)
+	}
+
+	mismatchedFEC := hello
+	if mismatchedFEC.FECDataShards == 1 && mismatchedFEC.FECParityShards == 1 {
+		mismatchedFEC.FECDataShards = 2
+	} else {
+		mismatchedFEC.FECDataShards = 1
+		mismatchedFEC.FECParityShards = 1
+	}
+	if mismatchedFEC.MTU > maxKCPMTU(mismatchedFEC.FECDataShards, mismatchedFEC.FECParityShards) {
+		mismatchedFEC.MTU = maxKCPMTU(mismatchedFEC.FECDataShards, mismatchedFEC.FECParityShards)
+	}
+	if err := ValidateBondHelloTuning(mismatchedFEC); err == nil {
+		t.Fatal("mismatched FEC profile unexpectedly accepted")
 	}
 }
 
