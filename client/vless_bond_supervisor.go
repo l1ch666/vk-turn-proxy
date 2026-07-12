@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cacggghp/vk-turn-proxy/metrics"
-	"github.com/cacggghp/vk-turn-proxy/tcputil"
+	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/tcputil"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )

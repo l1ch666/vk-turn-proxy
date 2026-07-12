@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cacggghp/vk-turn-proxy/baseline"
-	"github.com/cacggghp/vk-turn-proxy/diagnostics"
+	"github.com/l1ch666/vk-turn-proxy/baseline"
+	"github.com/l1ch666/vk-turn-proxy/diagnostics"
 )
 
 type cliOptions struct {

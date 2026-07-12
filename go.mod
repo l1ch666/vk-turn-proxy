@@ -1,4 +1,4 @@
-module github.com/cacggghp/vk-turn-proxy
+module github.com/l1ch666/vk-turn-proxy
 
 go 1.25.5
 

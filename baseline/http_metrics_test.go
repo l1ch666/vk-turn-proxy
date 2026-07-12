@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cacggghp/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/metrics"
 )
 
 const baselineTestToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

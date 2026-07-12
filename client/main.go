@@ -34,12 +34,12 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 
 	"github.com/bschaatsbergen/dnsdialer"
-	"github.com/cacggghp/vk-turn-proxy/diagnostics"
-	"github.com/cacggghp/vk-turn-proxy/metrics"
-	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/l1ch666/vk-turn-proxy/diagnostics"
+	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/tcputil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
@@ -459,7 +459,7 @@ func solvePoW(powInput string, difficulty int) string {
 var tlsClientProfileName string
 
 // defaultTLSProfile is the compile-time default profile. It can be overridden at
-// build time via -ldflags "-X github.com/cacggghp/vk-turn-proxy/client.defaultTLSProfile=mesh_android"
+// build time via -ldflags "-X github.com/l1ch666/vk-turn-proxy/client.defaultTLSProfile=mesh_android"
 // to produce per-profile builds without code edits.
 var defaultTLSProfile = "confirmed_android_2"
 

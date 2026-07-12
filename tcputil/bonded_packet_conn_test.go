@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cacggghp/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/metrics"
 )
 
 func TestBondedPacketConnWritesAcrossPaths(t *testing.T) {

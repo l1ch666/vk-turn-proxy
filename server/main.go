@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cacggghp/vk-turn-proxy/diagnostics"
-	"github.com/cacggghp/vk-turn-proxy/metrics"
-	"github.com/cacggghp/vk-turn-proxy/tcputil"
+	"github.com/l1ch666/vk-turn-proxy/diagnostics"
+	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/tcputil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/xtaci/smux"

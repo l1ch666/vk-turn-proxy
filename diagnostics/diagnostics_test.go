@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cacggghp/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/metrics"
 )
 
 const testToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

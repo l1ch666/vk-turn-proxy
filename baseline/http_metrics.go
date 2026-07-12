@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cacggghp/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/metrics"
 )
 
 const maximumMetricsResponseBytes = 2 << 20

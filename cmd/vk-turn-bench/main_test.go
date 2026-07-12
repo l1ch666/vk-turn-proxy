@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cacggghp/vk-turn-proxy/baseline"
+	"github.com/l1ch666/vk-turn-proxy/baseline"
 )
 
 func TestParseCLIProducesDeterministicMatrix(t *testing.T) {
