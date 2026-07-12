@@ -282,15 +282,30 @@ func NewKCPOverPacketConn(pc net.PacketConn, remote net.Addr, isServer bool) (*k
 // window would cap the combined throughput. The window scales with pathCount,
 // bounded to avoid pathological memory use.
 func NewKCPOverPacketConnBonded(pc net.PacketConn, remote net.Addr, isServer bool, pathCount int) (*kcp.UDPSession, error) {
+	return newKCPOverPacketConn(pc, remote, isServer, BondedKCPWindow(pathCount))
+}
+
+// BondedKCPWindow returns the bounded KCP window for an aggregate path count.
+// Division before multiplication prevents an attacker-controlled or malformed
+// path count from overflowing int before the memory-safety cap is applied.
+func BondedKCPWindow(pathCount int) int {
+	return bondedKCPWindow(KCPWindow, pathCount)
+}
+
+func bondedKCPWindow(baseWindow, pathCount int) int {
+	if baseWindow < 1 {
+		baseWindow = 1
+	}
+	if baseWindow >= maxKCPWindow {
+		return maxKCPWindow
+	}
 	if pathCount < 1 {
 		pathCount = 1
 	}
-	wnd := KCPWindow * pathCount
-	const maxWnd = 8192 // cap: ~8192*1200B ≈ 9.4MB of in-flight per direction
-	if wnd > maxWnd {
-		wnd = maxWnd
+	if pathCount > maxKCPWindow/baseWindow {
+		return maxKCPWindow
 	}
-	return newKCPOverPacketConn(pc, remote, isServer, wnd)
+	return baseWindow * pathCount
 }
 
 func newKCPOverPacketConn(pc net.PacketConn, remote net.Addr, isServer bool, window int) (*kcp.UDPSession, error) {
