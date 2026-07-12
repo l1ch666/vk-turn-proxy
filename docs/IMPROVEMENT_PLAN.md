@@ -28,7 +28,7 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 - [ ] Supervise and recreate the complete bond/KCP/smux session after failure.
 - [ ] Negotiate protocol version, expected path count, MTU, and FEC configuration.
 - [ ] Scale the server KCP window from the negotiated path count.
-- [ ] Validate all KCP, FEC, MTU, and smux configuration at startup.
+- [x] Validate all KCP, FEC, MTU, and smux configuration at startup.
 
 ## Phase 3: observability and baseline
 

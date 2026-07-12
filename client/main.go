@@ -1878,6 +1878,9 @@ func main() {
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
 	tlsClientProfileName = *tlsProfileFlag
+	if err := tcputil.ValidateTuning(); err != nil {
+		log.Fatalf("invalid transport tuning: %s", err)
+	}
 	log.Printf("tuning: %s", tcputil.TuningSummary())
 	if *genWrapKey {
 		key, keyErr := generateWrapKey()
@@ -2141,8 +2144,8 @@ func validateClientVLESSFlags(vlessMode, vlessBond bool, streamCount int) error 
 	if vlessBond && !vlessMode {
 		return fmt.Errorf("-vless-bond requires -vless")
 	}
-	if vlessMode && normalizeVLESSSessionCount(streamCount) < 1 {
-		return fmt.Errorf("VLESS session count must be positive")
+	if vlessMode && streamCount < 0 {
+		return fmt.Errorf("VLESS session count must not be negative")
 	}
 	return nil
 }

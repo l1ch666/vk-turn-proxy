@@ -3,7 +3,7 @@ package tcputil
 import "testing"
 
 func TestParseFEC(t *testing.T) {
-	cases := []struct {
+	valid := []struct {
 		in           string
 		wantD, wantP int
 	}{
@@ -11,18 +11,32 @@ func TestParseFEC(t *testing.T) {
 		{" 10 : 3 ", 10, 3},
 		{"", 0, 0},
 		{"0:0", 0, 0},
-		{"10", 0, 0},
-		{"10:0", 0, 0},
-		{"0:3", 0, 0},
-		{"abc:3", 0, 0},
-		{"10:x", 0, 0},
-		{"-1:3", 0, 0},
-		{"10:3:1", 0, 0}, // SplitN(2) -> "10","3:1" -> "3:1" not an int -> off
+		{"255:1", 255, 1},
 	}
-	for _, c := range cases {
-		d, p := parseFEC(c.in)
-		if d != c.wantD || p != c.wantP {
-			t.Errorf("parseFEC(%q) = (%d,%d), want (%d,%d)", c.in, d, p, c.wantD, c.wantP)
+	for _, tc := range valid {
+		d, p, err := parseFEC(tc.in)
+		if err != nil {
+			t.Errorf("parseFEC(%q) returned error: %v", tc.in, err)
+			continue
+		}
+		if d != tc.wantD || p != tc.wantP {
+			t.Errorf("parseFEC(%q) = (%d,%d), want (%d,%d)", tc.in, d, p, tc.wantD, tc.wantP)
+		}
+	}
+
+	invalid := []string{
+		"10",
+		"10:0",
+		"0:3",
+		"abc:3",
+		"10:x",
+		"-1:3",
+		"10:3:1",
+		"255:2",
+	}
+	for _, in := range invalid {
+		if _, _, err := parseFEC(in); err == nil {
+			t.Errorf("parseFEC(%q) unexpectedly succeeded", in)
 		}
 	}
 }

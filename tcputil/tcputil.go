@@ -1,7 +1,10 @@
 package tcputil
 
 import (
+	"errors"
 	"flag"
+	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -11,6 +14,16 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )
+
+const (
+	maxKCPWindow       = 8192
+	minKCPMTU          = 50
+	kcpXmitBufferSize  = 1500
+	kcpCryptHeaderSize = 20
+	kcpFECHeaderSize   = 8
+)
+
+var tuningEnvErrors []error
 
 // Tunable KCP/smux parameters. Defaults match the previous hardcoded values, so
 // behavior is unchanged unless overridden. Override precedence: -flag > env >
@@ -33,35 +46,65 @@ var (
 	// TCP-over-TCP retransmits otherwise collapse throughput. MUST match on client
 	// and server. The Android app sets VK_TURN_KCP_FEC=10:3 on both ends (client
 	// process env + server via vk-turn-control.sh) when "KCP FEC" is enabled.
-	kcpDataShards, kcpParityShards = parseFEC(os.Getenv("VK_TURN_KCP_FEC"))
+	kcpDataShards, kcpParityShards = envFEC("VK_TURN_KCP_FEC")
 )
 
 func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def
 	}
-	return def
+	n, err := parseEnvInt(v)
+	if err != nil {
+		tuningEnvErrors = append(tuningEnvErrors, fmt.Errorf("%s must be an integer: %w", key, err))
+		return def
+	}
+	return n
 }
 
-// parseFEC parses "data:parity" (e.g. "10:3"). Returns 0,0 (FEC off) on any
-// malformed/empty input or non-positive values.
-func parseFEC(v string) (int, int) {
-	v = strings.TrimSpace(v)
-	if v == "" {
+func parseEnvInt(v string) (int, error) {
+	return strconv.Atoi(strings.TrimSpace(v))
+}
+
+func envFEC(key string) (int, int) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
 		return 0, 0
 	}
-	parts := strings.SplitN(v, ":", 2)
-	if len(parts) != 2 {
-		return 0, 0
-	}
-	d, errD := strconv.Atoi(strings.TrimSpace(parts[0]))
-	p, errP := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if errD != nil || errP != nil || d <= 0 || p <= 0 {
+	d, p, err := parseFEC(v)
+	if err != nil {
+		tuningEnvErrors = append(tuningEnvErrors, fmt.Errorf("%s: %w", key, err))
 		return 0, 0
 	}
 	return d, p
+}
+
+// parseFEC parses "data:parity" (for example "10:3"). Empty and "0:0"
+// disable FEC; every other value must describe a valid Reed-Solomon profile.
+func parseFEC(v string) (int, int, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, 0, nil
+	}
+	parts := strings.Split(v, ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("expected data:parity")
+	}
+	d, errD := strconv.Atoi(strings.TrimSpace(parts[0]))
+	p, errP := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errD != nil || errP != nil {
+		return 0, 0, fmt.Errorf("data and parity shards must be integers")
+	}
+	if d == 0 && p == 0 {
+		return 0, 0, nil
+	}
+	if d <= 0 || p <= 0 {
+		return 0, 0, fmt.Errorf("data and parity shards must both be positive, or both zero")
+	}
+	if d > 256 || p > 256 || d > 256-p {
+		return 0, 0, fmt.Errorf("data and parity shards must total at most 256")
+	}
+	return d, p, nil
 }
 
 // FECShards returns the configured Reed-Solomon (dataShards, parityShards).
@@ -71,15 +114,104 @@ func FECShards() (int, int) { return kcpDataShards, kcpParityShards }
 // before flag.Parse() in each binary. Flag defaults are the env-or-default values,
 // so a flag overrides env, env overrides the built-in default.
 func RegisterTuningFlags() {
-	flag.IntVar(&KCPWindow, "kcp-window", KCPWindow, "KCP send/recv window in packets (higher = more in-flight for high-RTT TURN paths)")
-	flag.IntVar(&KCPInterval, "kcp-interval", KCPInterval, "KCP flush interval in ms (lower = lower latency, more CPU)")
-	flag.IntVar(&KCPMtu, "kcp-mtu", KCPMtu, "KCP MTU in bytes (must fit inside DTLS+TURN; keep <= inner tunnel MTU)")
-	flag.IntVar(&SmuxRecvBuf, "smux-recvbuf", SmuxRecvBuf, "smux max receive buffer in bytes")
-	flag.IntVar(&SmuxStreamBuf, "smux-streambuf", SmuxStreamBuf, "smux max per-stream buffer in bytes")
-	flag.Func("kcp-fec", "KCP Reed-Solomon FEC as data:parity (e.g. 10:3; empty/0:0 = off). MUST match server.", func(v string) error {
-		kcpDataShards, kcpParityShards = parseFEC(v)
+	registerTuningFlags(flag.CommandLine)
+}
+
+func registerTuningFlags(fs *flag.FlagSet) {
+	fs.IntVar(&KCPWindow, "kcp-window", KCPWindow, "KCP send/recv window in packets (higher = more in-flight for high-RTT TURN paths)")
+	fs.IntVar(&KCPInterval, "kcp-interval", KCPInterval, "KCP flush interval in ms (lower = lower latency, more CPU)")
+	fs.IntVar(&KCPNoDelay, "kcp-nodelay", KCPNoDelay, "KCP nodelay mode: 0 or 1")
+	fs.IntVar(&KCPResend, "kcp-resend", KCPResend, "KCP fast-resend threshold (0 disables)")
+	fs.IntVar(&KCPNC, "kcp-nc", KCPNC, "KCP congestion control: 0 enabled, 1 disabled")
+	fs.IntVar(&KCPMtu, "kcp-mtu", KCPMtu, "KCP MTU in bytes (must fit inside DTLS+TURN; keep <= inner tunnel MTU)")
+	fs.IntVar(&SmuxRecvBuf, "smux-recvbuf", SmuxRecvBuf, "smux max receive buffer in bytes")
+	fs.IntVar(&SmuxStreamBuf, "smux-streambuf", SmuxStreamBuf, "smux max per-stream buffer in bytes")
+	fs.Func("kcp-fec", "KCP Reed-Solomon FEC as data:parity (e.g. 10:3; empty/0:0 = off). MUST match server.", func(v string) error {
+		dataShards, parityShards, err := parseFEC(v)
+		if err != nil {
+			return err
+		}
+		kcpDataShards, kcpParityShards = dataShards, parityShards
 		return nil
 	})
+}
+
+type tuningValues struct {
+	window       int
+	interval     int
+	nodelay      int
+	resend       int
+	nc           int
+	mtu          int
+	smuxRecv     int
+	smuxStream   int
+	dataShards   int
+	parityShards int
+}
+
+func currentTuningValues() tuningValues {
+	return tuningValues{
+		window:       KCPWindow,
+		interval:     KCPInterval,
+		nodelay:      KCPNoDelay,
+		resend:       KCPResend,
+		nc:           KCPNC,
+		mtu:          KCPMtu,
+		smuxRecv:     SmuxRecvBuf,
+		smuxStream:   SmuxStreamBuf,
+		dataShards:   kcpDataShards,
+		parityShards: kcpParityShards,
+	}
+}
+
+// ValidateTuning rejects values that kcp-go/smux would otherwise silently
+// clamp, ignore, overflow, or accept only to fail later on the packet path.
+func ValidateTuning() error {
+	errs := append([]error(nil), tuningEnvErrors...)
+	if err := validateTuning(currentTuningValues()); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func validateTuning(v tuningValues) error {
+	var errs []error
+	if v.window < 1 || v.window > maxKCPWindow {
+		errs = append(errs, fmt.Errorf("kcp-window must be in 1..%d", maxKCPWindow))
+	}
+	if v.interval < 10 || v.interval > 5000 {
+		errs = append(errs, fmt.Errorf("kcp-interval must be in 10..5000 ms"))
+	}
+	if v.nodelay != 0 && v.nodelay != 1 {
+		errs = append(errs, fmt.Errorf("kcp-nodelay must be 0 or 1"))
+	}
+	if v.resend < 0 || int64(v.resend) > math.MaxInt32 {
+		errs = append(errs, fmt.Errorf("kcp-resend must be in 0..%d", math.MaxInt32))
+	}
+	if v.nc != 0 && v.nc != 1 {
+		errs = append(errs, fmt.Errorf("kcp-nc must be 0 or 1"))
+	}
+	if v.dataShards < 0 || v.parityShards < 0 ||
+		(v.dataShards == 0) != (v.parityShards == 0) ||
+		(v.dataShards > 0 && (v.dataShards > 256 || v.parityShards > 256 || v.dataShards > 256-v.parityShards)) {
+		errs = append(errs, fmt.Errorf("kcp-fec must be 0:0 or positive data:parity totaling at most 256"))
+	}
+	maxMTU := kcpXmitBufferSize - kcpCryptHeaderSize
+	if v.dataShards > 0 && v.parityShards > 0 {
+		maxMTU -= kcpFECHeaderSize
+	}
+	if v.mtu < minKCPMTU || v.mtu > maxMTU {
+		errs = append(errs, fmt.Errorf("kcp-mtu must be in %d..%d for the selected FEC profile", minKCPMTU, maxMTU))
+	}
+	if v.smuxRecv < 1 || int64(v.smuxRecv) > math.MaxInt32 {
+		errs = append(errs, fmt.Errorf("smux-recvbuf must be in 1..%d", math.MaxInt32))
+	}
+	if v.smuxStream < 1 || int64(v.smuxStream) > math.MaxInt32 {
+		errs = append(errs, fmt.Errorf("smux-streambuf must be in 1..%d", math.MaxInt32))
+	} else if v.smuxStream > v.smuxRecv {
+		errs = append(errs, fmt.Errorf("smux-streambuf must not exceed smux-recvbuf"))
+	}
+	return errors.Join(errs...)
 }
 
 // TuningSummary returns a one-line human-readable summary of active KCP/smux
@@ -91,8 +223,12 @@ func TuningSummary() string {
 	}
 	return "kcp[wnd=" + strconv.Itoa(KCPWindow) +
 		" interval=" + strconv.Itoa(KCPInterval) +
+		" nodelay=" + strconv.Itoa(KCPNoDelay) +
+		" resend=" + strconv.Itoa(KCPResend) +
+		" nc=" + strconv.Itoa(KCPNC) +
 		" mtu=" + strconv.Itoa(KCPMtu) +
-		" fec=" + fec + "]"
+		" fec=" + fec + "] smux[recv=" + strconv.Itoa(SmuxRecvBuf) +
+		" stream=" + strconv.Itoa(SmuxStreamBuf) + "]"
 }
 
 // DtlsPacketConn wraps a net.Conn (DTLS) as a net.PacketConn for KCP.
@@ -158,6 +294,13 @@ func NewKCPOverPacketConnBonded(pc net.PacketConn, remote net.Addr, isServer boo
 }
 
 func newKCPOverPacketConn(pc net.PacketConn, remote net.Addr, isServer bool, window int) (*kcp.UDPSession, error) {
+	if err := validateTuning(currentTuningValues()); err != nil {
+		return nil, fmt.Errorf("invalid transport tuning: %w", err)
+	}
+	if window < 1 || window > maxKCPWindow {
+		return nil, fmt.Errorf("KCP window must be in 1..%d", maxKCPWindow)
+	}
+
 	block, err := kcp.NewNoneBlockCrypt(nil) // DTLS already encrypts
 	if err != nil {
 		return nil, err
@@ -195,7 +338,10 @@ func newKCPOverPacketConn(pc net.PacketConn, remote net.Addr, isServer bool, win
 	// - Window sizes suitable for ~5Mbit/s
 	sess.SetNoDelay(KCPNoDelay, KCPInterval, KCPResend, KCPNC)
 	sess.SetWindowSize(window, window)
-	sess.SetMtu(KCPMtu) // must fit inside DTLS+TURN; keep <= inner tunnel MTU
+	if !sess.SetMtu(KCPMtu) {
+		_ = sess.Close()
+		return nil, fmt.Errorf("kcp rejected MTU %d", KCPMtu)
+	}
 	sess.SetACKNoDelay(true)
 
 	return sess, nil

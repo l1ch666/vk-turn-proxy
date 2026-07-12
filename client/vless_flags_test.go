@@ -16,6 +16,19 @@ func TestValidateClientVLESSFlagsRequiresVLESSForBond(t *testing.T) {
 	}
 }
 
+func TestValidateClientVLESSFlagsRejectsNegativeSessionCount(t *testing.T) {
+	err := validateClientVLESSFlags(true, false, -1)
+	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateClientVLESSFlagsAllowsAutomaticSessionCount(t *testing.T) {
+	if err := validateClientVLESSFlags(true, false, 0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestNormalizeVLESSSessionCountKeepsConfiguredStreams(t *testing.T) {
 	if got := normalizeVLESSSessionCount(10); got != 10 {
 		t.Fatalf("normalizeVLESSSessionCount(10) = %d, want 10", got)
