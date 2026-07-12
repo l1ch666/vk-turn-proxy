@@ -475,7 +475,9 @@ func pipeConn(ctx context.Context, c1, c2 net.Conn) {
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	context.AfterFunc(ctx2, func() {
+	deadlineDone := make(chan struct{})
+	stopDeadline := context.AfterFunc(ctx2, func() {
+		defer close(deadlineDone)
 		if err := c1.SetDeadline(time.Now()); err != nil {
 			log.Printf("pipeConn: failed to set deadline c1: %v", err)
 		}
@@ -489,6 +491,7 @@ func pipeConn(ctx context.Context, c1, c2 net.Conn) {
 
 	go func() {
 		defer wg.Done()
+		defer cancel()
 		if _, err := io.Copy(c1, c2); err != nil {
 			log.Printf("pipeConn: c1<-c2 copy error: %v", err)
 		}
@@ -496,12 +499,17 @@ func pipeConn(ctx context.Context, c1, c2 net.Conn) {
 
 	go func() {
 		defer wg.Done()
+		defer cancel()
 		if _, err := io.Copy(c2, c1); err != nil {
 			log.Printf("pipeConn: c2<-c1 copy error: %v", err)
 		}
 	}()
 
 	wg.Wait()
+	cancel()
+	if !stopDeadline() {
+		<-deadlineDone
+	}
 
 	// Reset deadlines
 	_ = c1.SetDeadline(time.Time{})
