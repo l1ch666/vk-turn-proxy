@@ -429,12 +429,27 @@ func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr s
 }
 
 func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr string) {
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	closeDone := make(chan struct{})
+	stopClose := context.AfterFunc(sessionCtx, func() {
+		defer close(closeDone)
+		if err := smuxSess.Close(); err != nil && err != smux.ErrGoAway {
+			log.Printf("failed to interrupt smux session: %v", err)
+		}
+	})
+	defer func() {
+		cancelSession()
+		if !stopClose() {
+			<-closeDone
+		}
+	}()
+
 	var wg sync.WaitGroup
 	for {
 		stream, err := smuxSess.AcceptStream()
 		if err != nil {
 			select {
-			case <-ctx.Done():
+			case <-sessionCtx.Done():
 			default:
 				log.Printf("smux accept error: %s", err)
 			}
@@ -452,9 +467,11 @@ func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr s
 			}()
 
 			// Connect to backend (Xray/VLESS)
-			backendConn, err := net.DialTimeout("tcp", connectAddr, 10*time.Second)
+			backendConn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(sessionCtx, "tcp", connectAddr)
 			if err != nil {
-				log.Printf("backend dial error: %s", err)
+				if sessionCtx.Err() == nil {
+					log.Printf("backend dial error: %s", err)
+				}
 				return
 			}
 			defer func() {
@@ -464,9 +481,10 @@ func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr s
 			}()
 
 			// Bidirectional copy
-			pipeConn(ctx, s, backendConn)
+			pipeConn(sessionCtx, s, backendConn)
 		}(stream)
 	}
+	cancelSession()
 	wg.Wait()
 }
 
