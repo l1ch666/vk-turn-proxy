@@ -20,7 +20,8 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 - [x] Use unique zero-based stream IDs in the plain UDP dispatcher.
 - [x] Prevent stale TURN readers from consuming packets after reconnect.
 - [x] Close DTLS and packet-pipe resources after failed handshakes.
-- [ ] Preserve TCP half-close semantics and make VLESS shutdown bounded.
+- [x] Make bidirectional proxy, smux, KCP, and bond shutdown bounded.
+- [ ] Add versioned TCP half-close signaling (smux v1 cannot express CloseWrite/CloseRead).
 
 ## Phase 2: bond correctness
 

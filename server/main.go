@@ -99,9 +99,7 @@ func main() {
 		panic(err)
 	}
 	context.AfterFunc(ctx, func() {
-		if err = listener.Close(); err != nil {
-			panic(err)
-		}
+		_ = listener.Close()
 	})
 
 	fmt.Println("Listening")
@@ -115,6 +113,9 @@ func main() {
 		select {
 		case <-ctx.Done():
 			wg1.Wait()
+			if bondManager != nil {
+				bondManager.Wait()
+			}
 			return
 		default:
 		}
@@ -215,6 +216,7 @@ type vlessBondManager struct {
 	connectAddr string
 	mu          sync.Mutex
 	groups      map[string]*vlessBondGroup
+	wg          sync.WaitGroup
 }
 
 func newVLESSBondManager(connectAddr string) *vlessBondManager {
@@ -239,16 +241,24 @@ func (m *vlessBondManager) Add(ctx context.Context, conn net.Conn) error {
 			pc:          tcputil.NewBondedPacketConn("vless-bond-server:" + bondID),
 		}
 		m.groups[bondID] = group
-		go group.run(ctx, func() {
-			m.mu.Lock()
-			delete(m.groups, bondID)
-			m.mu.Unlock()
-		})
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			group.run(ctx, func() {
+				m.mu.Lock()
+				delete(m.groups, bondID)
+				m.mu.Unlock()
+			})
+		}()
 	}
 	m.mu.Unlock()
 
 	group.add(conn)
 	return nil
+}
+
+func (m *vlessBondManager) Wait() {
+	m.wg.Wait()
 }
 
 type vlessBondGroup struct {
@@ -265,6 +275,16 @@ func (g *vlessBondGroup) add(conn net.Conn) {
 func (g *vlessBondGroup) run(ctx context.Context, onDone func()) {
 	defer onDone()
 	defer func() { _ = g.pc.Close() }()
+	closeDone := make(chan struct{})
+	stopClose := context.AfterFunc(ctx, func() {
+		defer close(closeDone)
+		_ = g.pc.Close()
+	})
+	defer func() {
+		if !stopClose() {
+			<-closeDone
+		}
+	}()
 
 	// Scale the receive/send window for the aggregate of bonded paths. Window
 	// sizes need not match the peer exactly (unlike FEC), so we size from the
@@ -399,6 +419,17 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 // handleVLESSConnection creates a KCP+smux session over DTLS and forwards
 // each smux stream as a TCP connection to the backend (Xray/VLESS).
 func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr string) {
+	closeDone := make(chan struct{})
+	stopClose := context.AfterFunc(ctx, func() {
+		defer close(closeDone)
+		_ = dtlsConn.Close()
+	})
+	defer func() {
+		if !stopClose() {
+			<-closeDone
+		}
+	}()
+
 	// 1. Create KCP session over DTLS
 	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, true)
 	if err != nil {
