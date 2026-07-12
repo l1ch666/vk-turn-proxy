@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cacggghp/vk-turn-proxy/diagnostics"
 	"github.com/cacggghp/vk-turn-proxy/metrics"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/pion/dtls/v3"
@@ -30,6 +31,7 @@ func main() {
 	wrap := flag.Bool("wrap", false, "accept WRAP compatibility mode")
 	wrapKey := flag.String("wrap-key", "", "64-hex WRAP key")
 	genWrapKey := flag.Bool("gen-wrap-key", false, "generate a 64-hex WRAP key and exit")
+	diagnosticOptions := diagnostics.RegisterFlags(flag.CommandLine)
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
 	if err := tcputil.ValidateTuning(); err != nil {
@@ -43,6 +45,10 @@ func main() {
 		}
 		fmt.Println(key)
 		return
+	}
+	diagnosticConfig, diagnosticErr := diagnosticOptions.Config()
+	if diagnosticErr != nil {
+		log.Fatalf("invalid diagnostics configuration: %s", diagnosticErr)
 	}
 	if err := validateServerVLESSFlags(*vlessMode, *vlessBond); err != nil {
 		log.Fatalf("%s", err)
@@ -72,6 +78,9 @@ func main() {
 		<-signalChan
 		log.Fatalf("Exit...\n")
 	}()
+	if _, err := diagnostics.Start(ctx, diagnosticConfig, &metrics.Process); err != nil {
+		log.Fatalf("start diagnostics: %s", err)
+	}
 
 	addr, err := net.ResolveUDPAddr("udp", *listen)
 	if err != nil {

@@ -34,6 +34,7 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 
 	"github.com/bschaatsbergen/dnsdialer"
+	"github.com/cacggghp/vk-turn-proxy/diagnostics"
 	"github.com/cacggghp/vk-turn-proxy/metrics"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
@@ -1878,6 +1879,7 @@ func main() {
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	tlsProfileFlag := flag.String("tls-profile", "", "tls-client profile for VK auth/captcha (e.g. confirmed_android_2, mesh_android, chrome_146); env VK_TURN_TLS_PROFILE overrides")
+	diagnosticOptions := diagnostics.RegisterFlags(flag.CommandLine)
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
 	tlsClientProfileName = *tlsProfileFlag
@@ -1892,6 +1894,10 @@ func main() {
 		}
 		fmt.Println(key)
 		return
+	}
+	diagnosticConfig, diagnosticErr := diagnosticOptions.Config()
+	if diagnosticErr != nil {
+		log.Fatalf("invalid diagnostics configuration: %s", diagnosticErr)
 	}
 	bondProtocolMode, protocolErr := parseVLESSBondProtocolMode(*vlessBondProtocol)
 	if protocolErr != nil {
@@ -1971,6 +1977,9 @@ func main() {
 		link:     link,
 		udp:      *udp,
 		getCreds: getCreds,
+	}
+	if _, err := diagnostics.Start(ctx, diagnosticConfig, &metrics.Process); err != nil {
+		log.Fatalf("start diagnostics: %s", err)
 	}
 
 	if *vlessMode {
