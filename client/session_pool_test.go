@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"net"
+	"sync"
 	"testing"
 
 	"github.com/xtaci/smux"
@@ -54,21 +57,40 @@ func TestPickLeastLoadedPrefersFewestStreams(t *testing.T) {
 	defer cleanBusy()
 	cIdle, sIdle, cleanIdle := newSmuxPair(t)
 	defer cleanIdle()
-	_ = sBusy
 	_ = sIdle
 
-	// Accept streams on the busy server side so the client session reports a
-	// non-zero NumStreams. smux counts a stream once both ends are aware.
-	acceptDone := make(chan struct{})
+	// Accept and consume one byte from each stream so every client write is
+	// acknowledged before the server side can close. Keep all streams open
+	// until the pool assertions finish so NumStreams remains deterministic.
+	acceptResult := make(chan error, 1)
+	releaseAccepted := make(chan struct{})
+	serverDone := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseAccepted) }) }
+	defer release()
 	go func() {
+		defer close(serverDone)
+		accepted := make([]*smux.Stream, 0, 3)
+		defer func() {
+			for _, stream := range accepted {
+				_ = stream.Close()
+			}
+		}()
 		for i := 0; i < 3; i++ {
 			st, err := sBusy.AcceptStream()
 			if err != nil {
+				acceptResult <- fmt.Errorf("accept stream %d: %w", i, err)
 				return
 			}
-			defer func() { _ = st.Close() }()
+			accepted = append(accepted, st)
+			var payload [1]byte
+			if _, err := io.ReadFull(st, payload[:]); err != nil {
+				acceptResult <- fmt.Errorf("read stream %d: %w", i, err)
+				return
+			}
 		}
-		close(acceptDone)
+		acceptResult <- nil
+		<-releaseAccepted
 	}()
 
 	for i := 0; i < 3; i++ {
@@ -83,7 +105,9 @@ func TestPickLeastLoadedPrefersFewestStreams(t *testing.T) {
 		}
 		defer func() { _ = st.Close() }()
 	}
-	<-acceptDone
+	if err := <-acceptResult; err != nil {
+		t.Fatal(err)
+	}
 
 	if cBusy.NumStreams() == 0 {
 		t.Fatalf("busy session should report streams, got 0")
@@ -102,6 +126,8 @@ func TestPickLeastLoadedPrefersFewestStreams(t *testing.T) {
 			t.Fatalf("pick %d: expected idle session, got busy", i)
 		}
 	}
+	release()
+	<-serverDone
 }
 
 func TestPickLeastLoadedSkipsClosed(t *testing.T) {
