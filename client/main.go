@@ -1867,15 +1867,15 @@ func main() {
 	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
 	streamsPerCred := flag.Int("streams-per-cred", defaultStreamsPerCache, "TURN streams that share one credential cache")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
-	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
+	noDTLS := flag.Bool("no-dtls", false, "unsupported compatibility flag; exits with an error")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	vlessBond := flag.Bool("vless-bond", false, "VLESS bond mode: packet-level multipath across TURN/DTLS streams; requires -vless")
 	vlessBondProtocol := flag.String("vless-bond-protocol", "auto", "VLESS bond control protocol: auto, v1, or v2")
-	dnsMode := flag.String("dns", "auto", "DNS mode for VK resolver: auto, udp, or doh")
+	dnsMode := flag.String("dns", "auto", "DNS mode for VK resolver: auto or udp")
 	dnsServers := flag.String("dns-servers", "", "comma-separated DNS resolvers for VK auth, with optional ports")
-	wrap := flag.Bool("wrap", false, "accept WRAP compatibility mode")
-	wrapKey := flag.String("wrap-key", "", "64-hex WRAP key")
-	genWrapKey := flag.Bool("gen-wrap-key", false, "generate a 64-hex WRAP key and exit")
+	wrap := flag.Bool("wrap", false, "unsupported compatibility flag; exits with an error")
+	wrapKey := flag.String("wrap-key", "", "unsupported compatibility flag; exits with an error")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "unsupported compatibility flag; exits with an error")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	tlsProfileFlag := flag.String("tls-profile", "", "tls-client profile for VK auth/captcha (e.g. confirmed_android_2, mesh_android, chrome_146); env VK_TURN_TLS_PROFILE overrides")
@@ -1883,18 +1883,13 @@ func main() {
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
 	tlsClientProfileName = *tlsProfileFlag
+	if err := validateClientCompatibilityFlags(*noDTLS, *dnsMode, *wrap, *wrapKey, *genWrapKey); err != nil {
+		log.Fatalf("%s", err)
+	}
 	if err := tcputil.ValidateTuning(); err != nil {
 		log.Fatalf("invalid transport tuning: %s", err)
 	}
 	log.Printf("tuning: %s", tcputil.TuningSummary())
-	if *genWrapKey {
-		key, keyErr := generateWrapKey()
-		if keyErr != nil {
-			log.Fatalf("generate wrap key: %s", keyErr)
-		}
-		fmt.Println(key)
-		return
-	}
 	diagnosticConfig, diagnosticErr := diagnosticOptions.Config()
 	if diagnosticErr != nil {
 		log.Fatalf("invalid diagnostics configuration: %s", diagnosticErr)
@@ -1906,9 +1901,6 @@ func main() {
 	if err := validateClientVLESSFlags(*vlessMode, *vlessBond, *n); err != nil {
 		log.Fatalf("%s", err)
 	}
-	if err := validateClientCompatibilityFlags(*dnsMode, *wrap, *wrapKey); err != nil {
-		log.Fatalf("%s", err)
-	}
 	streamsPerCache = normalizeStreamsPerCredential(*streamsPerCred)
 	resolvers := defaultDNSResolvers
 	if strings.TrimSpace(*dnsServers) != "" {
@@ -1917,12 +1909,6 @@ func main() {
 			log.Fatalf("bad -dns-servers: %s", parseErr)
 		}
 		resolvers = parsedResolvers
-	}
-	if strings.EqualFold(strings.TrimSpace(*dnsMode), "doh") {
-		log.Printf("DNS mode doh requested; this core uses UDP resolvers for VK auth")
-	}
-	if *wrap {
-		log.Printf("wrap mode: requested; compatibility flags accepted, packet wrapping is not implemented in this build")
 	}
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
@@ -2044,10 +2030,6 @@ func main() {
 
 	wg1 := sync.WaitGroup{}
 	t := time.Tick(200 * time.Millisecond)
-
-	if *direct {
-		log.Panicf("Direct mode not supported with dispatcher")
-	}
 
 	okchan := make(chan struct{})
 	connchan := make(chan net.PacketConn)
@@ -2219,32 +2201,21 @@ func parseDNSServers(raw string) ([]string, error) {
 	return servers, nil
 }
 
-func validateClientCompatibilityFlags(dnsMode string, wrap bool, wrapKey string) error {
-	switch strings.ToLower(strings.TrimSpace(dnsMode)) {
-	case "", "auto", "udp", "doh":
-	default:
-		return fmt.Errorf("unsupported -dns mode %q (expected auto, udp, or doh)", dnsMode)
+func validateClientCompatibilityFlags(noDTLS bool, dnsMode string, wrap bool, wrapKey string, generateWrapKey bool) error {
+	if noDTLS {
+		return fmt.Errorf("-no-dtls is not implemented in this build")
 	}
-	if wrap && !isHexKey64(wrapKey) {
-		return fmt.Errorf("bad -wrap-key (need 64 hex)")
+	switch strings.ToLower(strings.TrimSpace(dnsMode)) {
+	case "", "auto", "udp":
+	case "doh":
+		return fmt.Errorf("-dns=doh is not implemented in this build")
+	default:
+		return fmt.Errorf("unsupported -dns mode %q (expected auto or udp)", dnsMode)
+	}
+	if wrap || wrapKey != "" || generateWrapKey {
+		return fmt.Errorf("WRAP compatibility mode is not implemented in this build")
 	}
 	return nil
-}
-
-func isHexKey64(value string) bool {
-	if len(value) != 64 {
-		return false
-	}
-	_, err := hex.DecodeString(value)
-	return err == nil
-}
-
-func generateWrapKey() (string, error) {
-	var key [32]byte
-	if _, err := cryptorand.Read(key[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(key[:]), nil
 }
 
 func generateBondID() (string, error) {

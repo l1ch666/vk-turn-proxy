@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	cryptorand "crypto/rand"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -28,32 +26,24 @@ func main() {
 	connect := flag.String("connect", "", "connect to ip:port")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	vlessBond := flag.Bool("vless-bond", false, "VLESS bond mode: packet-level multipath across TURN/DTLS streams; requires -vless")
-	wrap := flag.Bool("wrap", false, "accept WRAP compatibility mode")
-	wrapKey := flag.String("wrap-key", "", "64-hex WRAP key")
-	genWrapKey := flag.Bool("gen-wrap-key", false, "generate a 64-hex WRAP key and exit")
+	wrap := flag.Bool("wrap", false, "unsupported compatibility flag; exits with an error")
+	wrapKey := flag.String("wrap-key", "", "unsupported compatibility flag; exits with an error")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "unsupported compatibility flag; exits with an error")
 	diagnosticOptions := diagnostics.RegisterFlags(flag.CommandLine)
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
+	if err := validateServerCompatibilityFlags(*wrap, *wrapKey, *genWrapKey); err != nil {
+		log.Fatalf("%s", err)
+	}
 	if err := tcputil.ValidateTuning(); err != nil {
 		log.Fatalf("invalid transport tuning: %s", err)
 	}
 	log.Printf("tuning: %s", tcputil.TuningSummary())
-	if *genWrapKey {
-		key, keyErr := generateWrapKey()
-		if keyErr != nil {
-			log.Fatalf("generate wrap key: %s", keyErr)
-		}
-		fmt.Println(key)
-		return
-	}
 	diagnosticConfig, diagnosticErr := diagnosticOptions.Config()
 	if diagnosticErr != nil {
 		log.Fatalf("invalid diagnostics configuration: %s", diagnosticErr)
 	}
 	if err := validateServerVLESSFlags(*vlessMode, *vlessBond); err != nil {
-		log.Fatalf("%s", err)
-	}
-	if err := validateServerCompatibilityFlags(*wrap, *wrapKey); err != nil {
 		log.Fatalf("%s", err)
 	}
 	log.Printf("vless mode: %s", enabledText(*vlessMode))
@@ -62,9 +52,6 @@ func main() {
 		if *vlessBond {
 			log.Printf("vless bond semantics: packet-level multipath over TURN/DTLS paths")
 		}
-	}
-	if *wrap {
-		log.Printf("wrap mode: requested; compatibility flags accepted, packet wrapping is not implemented in this build")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -195,27 +182,11 @@ func validateServerVLESSFlags(vlessMode, vlessBond bool) error {
 	return nil
 }
 
-func validateServerCompatibilityFlags(wrap bool, wrapKey string) error {
-	if wrap && !isHexKey64(wrapKey) {
-		return fmt.Errorf("bad -wrap-key (need 64 hex)")
+func validateServerCompatibilityFlags(wrap bool, wrapKey string, generateWrapKey bool) error {
+	if wrap || wrapKey != "" || generateWrapKey {
+		return fmt.Errorf("WRAP compatibility mode is not implemented in this build")
 	}
 	return nil
-}
-
-func isHexKey64(value string) bool {
-	if len(value) != 64 {
-		return false
-	}
-	_, err := hex.DecodeString(value)
-	return err == nil
-}
-
-func generateWrapKey() (string, error) {
-	var key [32]byte
-	if _, err := cryptorand.Read(key[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(key[:]), nil
 }
 
 func enabledText(enabled bool) string {

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -28,31 +27,28 @@ func TestValidateServerVLESSFlagsAllowsPlainMode(t *testing.T) {
 	}
 }
 
-func TestValidateServerCompatibilityFlagsAllowsWrapKey(t *testing.T) {
-	if err := validateServerCompatibilityFlags(true, strings.Repeat("a", 64)); err != nil {
+func TestValidateServerCompatibilityFlagsAllowsDefault(t *testing.T) {
+	if err := validateServerCompatibilityFlags(false, "", false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestValidateServerCompatibilityFlagsRejectsBadWrapKey(t *testing.T) {
-	err := validateServerCompatibilityFlags(true, "bad")
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "bad -wrap-key") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestGenerateWrapKeyReturnsHex32Bytes(t *testing.T) {
-	key, err := generateWrapKey()
-	if err != nil {
-		t.Fatalf("generateWrapKey returned error: %v", err)
-	}
-	if len(key) != 64 {
-		t.Fatalf("wrap key length = %d, want 64", len(key))
-	}
-	if _, err := hex.DecodeString(key); err != nil {
-		t.Fatalf("wrap key is not hex: %v", err)
+func TestValidateServerCompatibilityFlagsRejectsUnimplementedWrapModes(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		wrap            bool
+		wrapKey         string
+		generateWrapKey bool
+	}{
+		{name: "wrap", wrap: true},
+		{name: "wrap key", wrapKey: strings.Repeat("a", 64)},
+		{name: "generate wrap key", generateWrapKey: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateServerCompatibilityFlags(test.wrap, test.wrapKey, test.generateWrapKey)
+			if err == nil || !strings.Contains(err.Error(), "WRAP compatibility mode is not implemented") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }

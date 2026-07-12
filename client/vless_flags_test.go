@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -73,15 +72,14 @@ func TestParseDNSServersAddsDefaultPort(t *testing.T) {
 	}
 }
 
-func TestValidateClientCompatibilityFlagsAllowsAndroidFlags(t *testing.T) {
-	key := strings.Repeat("a", 64)
-	if err := validateClientCompatibilityFlags("udp", true, key); err != nil {
+func TestValidateClientCompatibilityFlagsAllowsSupportedFlags(t *testing.T) {
+	if err := validateClientCompatibilityFlags(false, "udp", false, "", false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
 func TestValidateClientCompatibilityFlagsRejectsBadDNSMode(t *testing.T) {
-	err := validateClientCompatibilityFlags("https", false, "")
+	err := validateClientCompatibilityFlags(false, "https", false, "", false)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -90,25 +88,28 @@ func TestValidateClientCompatibilityFlagsRejectsBadDNSMode(t *testing.T) {
 	}
 }
 
-func TestValidateClientCompatibilityFlagsRejectsBadWrapKey(t *testing.T) {
-	err := validateClientCompatibilityFlags("auto", true, "not-hex")
-	if err == nil {
-		t.Fatal("expected error")
+func TestValidateClientCompatibilityFlagsRejectsUnimplementedModes(t *testing.T) {
+	tests := []struct {
+		name            string
+		noDTLS          bool
+		dnsMode         string
+		wrap            bool
+		wrapKey         string
+		generateWrapKey bool
+		want            string
+	}{
+		{name: "no DTLS", noDTLS: true, dnsMode: "auto", want: "-no-dtls is not implemented"},
+		{name: "DoH", dnsMode: "doh", want: "-dns=doh is not implemented"},
+		{name: "wrap", dnsMode: "auto", wrap: true, want: "WRAP compatibility mode is not implemented"},
+		{name: "wrap key", dnsMode: "auto", wrapKey: strings.Repeat("a", 64), want: "WRAP compatibility mode is not implemented"},
+		{name: "generate wrap key", dnsMode: "auto", generateWrapKey: true, want: "WRAP compatibility mode is not implemented"},
 	}
-	if !strings.Contains(err.Error(), "bad -wrap-key") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestGenerateWrapKeyReturnsHex32Bytes(t *testing.T) {
-	key, err := generateWrapKey()
-	if err != nil {
-		t.Fatalf("generateWrapKey returned error: %v", err)
-	}
-	if len(key) != 64 {
-		t.Fatalf("wrap key length = %d, want 64", len(key))
-	}
-	if _, err := hex.DecodeString(key); err != nil {
-		t.Fatalf("wrap key is not hex: %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateClientCompatibilityFlags(test.noDTLS, test.dnsMode, test.wrap, test.wrapKey, test.generateWrapKey)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want substring %q", err, test.want)
+			}
+		})
 	}
 }

@@ -53,7 +53,7 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 
 - [ ] Authenticate the DTLS peer with a pinned server identity and client PSK or mTLS.
 - [ ] Add global/per-IP resource limits and bounded backend/smux concurrency.
-- [ ] Make unimplemented compatibility flags fail safely.
+- [x] Make unimplemented compatibility flags fail safely.
 - [ ] Run releases only from commits that passed required CI checks.
 - [ ] Publish checksums, SBOM, provenance, and signed artifacts.
 - [ ] Correct README/module/artifact provenance for this repository.
