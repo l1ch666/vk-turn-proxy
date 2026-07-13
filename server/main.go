@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,16 +30,23 @@ func main() {
 	wrap := flag.Bool("wrap", false, "unsupported compatibility flag; exits with an error")
 	wrapKey := flag.String("wrap-key", "", "unsupported compatibility flag; exits with an error")
 	genWrapKey := flag.Bool("gen-wrap-key", false, "unsupported compatibility flag; exits with an error")
+	maxConnections := flag.Int("max-connections", defaultMaxTransportConnections, "maximum active DTLS transport connections")
+	maxConnectionsPerIP := flag.Int("max-connections-per-ip", defaultMaxTransportConnectionsPerIP, "maximum active DTLS transport connections per source IP")
 	diagnosticOptions := diagnostics.RegisterFlags(flag.CommandLine)
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
 	if err := validateServerCompatibilityFlags(*wrap, *wrapKey, *genWrapKey); err != nil {
 		log.Fatalf("%s", err)
 	}
+	connectionLimiter, limitErr := newConnectionLimiter(*maxConnections, *maxConnectionsPerIP)
+	if limitErr != nil {
+		log.Fatalf("invalid connection limits: %s", limitErr)
+	}
 	if err := tcputil.ValidateTuning(); err != nil {
 		log.Fatalf("invalid transport tuning: %s", err)
 	}
 	log.Printf("tuning: %s", tcputil.TuningSummary())
+	log.Printf("connection limits: total=%d per-ip=%d", *maxConnections, *maxConnectionsPerIP)
 	diagnosticConfig, diagnosticErr := diagnosticOptions.Config()
 	if diagnosticErr != nil {
 		log.Fatalf("invalid diagnostics configuration: %s", diagnosticErr)
@@ -109,6 +117,7 @@ func main() {
 	}
 
 	wg1 := sync.WaitGroup{}
+	var connectionRejections atomic.Uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -125,9 +134,31 @@ func main() {
 			log.Println(err)
 			continue
 		}
+		lease, rejection := connectionLimiter.Acquire(conn.RemoteAddr())
+		if lease == nil {
+			metrics.Process.ConnectionLimitRejected()
+			count := connectionRejections.Add(1)
+			if shouldLogConnectionRejection(count) {
+				log.Printf("transport connection rejected from %v: %s (total rejections: %d)", conn.RemoteAddr(), rejection, count)
+			}
+			_ = conn.Close()
+			continue
+		}
+		metrics.Process.TransportConnectionOpened()
+		releaseConnection := func() {
+			if lease.Release() {
+				metrics.Process.TransportConnectionClosed()
+			}
+		}
 		wg1.Add(1)
-		go func(conn net.Conn) {
+		go func(conn net.Conn, releaseConnection func()) {
 			defer wg1.Done()
+			releaseOnReturn := true
+			defer func() {
+				if releaseOnReturn {
+					releaseConnection()
+				}
+			}()
 			ownsConn := true
 			defer func() {
 				if !ownsConn {
@@ -157,11 +188,12 @@ func main() {
 
 			if *vlessMode {
 				if *vlessBond {
-					if err := bondManager.Add(ctx, dtlsConn); err != nil {
+					if err := bondManager.AddWithCleanup(ctx, dtlsConn, releaseConnection); err != nil {
 						log.Printf("VLESS bond path rejected: %s", err)
 						return
 					}
 					ownsConn = false
+					releaseOnReturn = false
 					log.Printf("VLESS bond path accepted: %s\n", conn.RemoteAddr())
 					return
 				}
@@ -171,7 +203,7 @@ func main() {
 			}
 
 			log.Printf("Connection closed: %s\n", conn.RemoteAddr())
-		}(conn)
+		}(conn, releaseConnection)
 	}
 }
 
@@ -215,6 +247,14 @@ func newVLESSBondManager(connectAddr string) *vlessBondManager {
 }
 
 func (m *vlessBondManager) Add(ctx context.Context, conn net.Conn) error {
+	return m.add(ctx, conn, nil)
+}
+
+func (m *vlessBondManager) AddWithCleanup(ctx context.Context, conn net.Conn, cleanup func()) error {
+	return m.add(ctx, conn, cleanup)
+}
+
+func (m *vlessBondManager) add(ctx context.Context, conn net.Conn, cleanup func()) error {
 	hello, err := tcputil.ReadBondHelloConfig(conn)
 	if err != nil {
 		return err
@@ -255,7 +295,7 @@ func (m *vlessBondManager) Add(ctx context.Context, conn net.Conn) error {
 
 	// The first path must be visible before run starts, otherwise the server
 	// sizes KCP from an empty bond and remains capped at a single-path window.
-	if err := group.add(conn); err != nil {
+	if err := group.addWithCleanup(conn, cleanup); err != nil {
 		return err
 	}
 	group.startOnce.Do(func() {
@@ -309,12 +349,16 @@ func (g *vlessBondGroup) matchesHello(hello tcputil.BondHello) bool {
 }
 
 func (g *vlessBondGroup) add(conn net.Conn) error {
+	return g.addWithCleanup(conn, nil)
+}
+
+func (g *vlessBondGroup) addWithCleanup(conn net.Conn, cleanup func()) error {
 	g.mu.Lock()
 	if g.hello.Version == tcputil.BondProtocolV2 && g.pc.Count() >= g.hello.ExpectedPaths {
 		g.mu.Unlock()
 		return fmt.Errorf("vless bond %s already has its negotiated %d paths", g.shortID(), g.hello.ExpectedPaths)
 	}
-	g.pc.AddConn(conn, nil)
+	g.pc.AddConn(conn, cleanup)
 	active := g.pc.Count()
 	if active > g.maxPaths {
 		g.maxPaths = active

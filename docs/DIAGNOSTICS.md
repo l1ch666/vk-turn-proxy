@@ -69,6 +69,11 @@ paths; process byte, operation, error, and latency totals are not discarded
 when a path leaves that history. Write latency is sampled once every 64 physical
 path writes to keep hot-path overhead bounded.
 
+On the server, `active_transport_connections` includes admitted DTLS
+connections and bonded paths from admission through final close.
+`connection_limit_rejections` is the cumulative number refused by the global
+or per-IP admission limit (including peers with an unusable remote address).
+
 The nested `kcp` object is a process-wide snapshot from `kcp-go`; the library
 does not expose these counters per session. `retransmitted_segments` is the
 library's cumulative total of timeout/lost, fast, and early retransmissions.

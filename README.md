@@ -98,11 +98,14 @@ The active engineering roadmap is tracked in
   them in benchmark notes, service files, or committed configuration.
 - The diagnostics listener must remain loopback-only. Use an authenticated SSH
   tunnel when remote access is necessary.
+- The server admits at most 256 active DTLS transports and 64 per source IP by
+  default. Tune `-max-connections` and `-max-connections-per-ip` together when a
+  deployment legitimately needs more bonded paths.
 - DTLS encrypts the data plane, but pinned peer identity or PSK/mTLS
   authentication is not implemented yet. Do not assume protection against an
   active man-in-the-middle until that roadmap item is complete.
-- Release signing, checksums, SBOM/provenance, resource limits, and hardened
-  service/container definitions are still roadmap items.
+- Release signing, checksums, SBOM/provenance, backend/smux concurrency limits,
+  and hardened service/container definitions are still roadmap items.
 
 ## Development checks
 

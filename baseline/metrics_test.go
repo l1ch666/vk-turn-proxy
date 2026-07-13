@@ -8,6 +8,7 @@ import (
 
 func TestDiffMetrics(t *testing.T) {
 	before := metrics.Snapshot{
+		ConnectionLimitRejections:    5,
 		PathReconnects:               1,
 		SessionReconnects:            2,
 		AuthFailures:                 3,
@@ -28,6 +29,7 @@ func TestDiffMetrics(t *testing.T) {
 		},
 	}
 	after := before
+	after.ConnectionLimitRejections += 2
 	after.PathReconnects += 2
 	after.SessionReconnects += 3
 	after.AuthFailures++
@@ -49,7 +51,7 @@ func TestDiffMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DiffMetrics: %v", err)
 	}
-	if delta.PathReconnects != 2 || delta.SessionReconnects != 3 || delta.AuthFailures != 1 || delta.QueueDrops != 4 ||
+	if delta.ConnectionLimitRejections != 2 || delta.PathReconnects != 2 || delta.SessionReconnects != 3 || delta.AuthFailures != 1 || delta.QueueDrops != 4 ||
 		delta.BytesRead != 1000 || delta.BytesWritten != 2000 || delta.ReadErrors != 2 || delta.WriteErrors != 3 ||
 		delta.WriteLatencySamples != 4 || delta.WriteLatencyTotalNanoseconds != 400 ||
 		delta.KCP.ApplicationBytesSent != 500 || delta.KCP.RetransmittedSegments != 5 ||

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -179,6 +180,37 @@ func TestVLESSBondManagerWaitsForGroupShutdown(t *testing.T) {
 	defer manager.mu.Unlock()
 	if len(manager.groups) != 0 {
 		t.Fatalf("bond manager retained %d stopped groups", len(manager.groups))
+	}
+}
+
+func TestVLESSBondManagerRunsPathCleanupExactlyOnce(t *testing.T) {
+	manager := newVLESSBondManager("127.0.0.1:1")
+	serverConn, peerConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = peerConn.Close()
+	})
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- tcputil.WriteBondHello(peerConn, "0123456789abcdef")
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	var cleanupCalls atomic.Int32
+	if err := manager.AddWithCleanup(ctx, serverConn, func() { cleanupCalls.Add(1) }); err != nil {
+		cancel()
+		t.Fatalf("failed to add bond path: %v", err)
+	}
+	if err := <-writeDone; err != nil {
+		cancel()
+		t.Fatalf("failed to write bond hello: %v", err)
+	}
+
+	cancel()
+	manager.Wait()
+	_ = serverConn.Close()
+	if got := cleanupCalls.Load(); got != 1 {
+		t.Fatalf("path cleanup calls = %d, want 1", got)
 	}
 }
 

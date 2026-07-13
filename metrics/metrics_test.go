@@ -14,7 +14,9 @@ func TestRegistrySnapshot(t *testing.T) {
 	path1 := registry.OpenPath("bond/path-1")
 	path2 := registry.OpenPath("bond/path-2")
 	path1.Close()
+	registry.TransportConnectionOpened()
 	registry.SessionOpened()
+	registry.ConnectionLimitRejected()
 	registry.PathReconnected()
 	registry.SessionReconnected()
 	registry.AuthFailed()
@@ -22,15 +24,19 @@ func TestRegistrySnapshot(t *testing.T) {
 
 	got := registry.Snapshot()
 	want := Snapshot{
-		ActivePaths:       1,
-		ActiveSessions:    1,
-		PathReconnects:    1,
-		SessionReconnects: 1,
-		AuthFailures:      1,
-		QueueDrops:        1,
+		ActiveTransportConnections: 1,
+		ActivePaths:                1,
+		ActiveSessions:             1,
+		ConnectionLimitRejections:  1,
+		PathReconnects:             1,
+		SessionReconnects:          1,
+		AuthFailures:               1,
+		QueueDrops:                 1,
 	}
-	if got.ActivePaths != want.ActivePaths ||
+	if got.ActiveTransportConnections != want.ActiveTransportConnections ||
+		got.ActivePaths != want.ActivePaths ||
 		got.ActiveSessions != want.ActiveSessions ||
+		got.ConnectionLimitRejections != want.ConnectionLimitRejections ||
 		got.PathReconnects != want.PathReconnects ||
 		got.SessionReconnects != want.SessionReconnects ||
 		got.AuthFailures != want.AuthFailures ||
@@ -44,6 +50,10 @@ func TestRegistrySnapshot(t *testing.T) {
 		t.Fatalf("zero-value registry unexpectedly inherited process KCP counters: %+v", got.KCP)
 	}
 	path2.Close()
+	registry.TransportConnectionClosed()
+	if got := registry.Snapshot().ActiveTransportConnections; got != 0 {
+		t.Fatalf("active transport connections after close = %d, want 0", got)
+	}
 }
 
 func TestRegistryConcurrentCounters(t *testing.T) {
@@ -58,6 +68,7 @@ func TestRegistryConcurrentCounters(t *testing.T) {
 			for range iterations {
 				registry.PathReconnected()
 				registry.QueueDropped()
+				registry.ConnectionLimitRejected()
 			}
 		}()
 	}
@@ -65,8 +76,8 @@ func TestRegistryConcurrentCounters(t *testing.T) {
 
 	snapshot := registry.Snapshot()
 	want := int64(workers * iterations)
-	if snapshot.PathReconnects != want || snapshot.QueueDrops != want {
-		t.Fatalf("concurrent snapshot = %+v, want reconnects/drops %d", snapshot, want)
+	if snapshot.PathReconnects != want || snapshot.QueueDrops != want || snapshot.ConnectionLimitRejections != want {
+		t.Fatalf("concurrent snapshot = %+v, want reconnects/drops/rejections %d", snapshot, want)
 	}
 }
 

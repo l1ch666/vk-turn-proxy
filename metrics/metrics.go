@@ -66,8 +66,10 @@ type KCPSnapshot struct {
 // Individual atomic fields may advance while a snapshot is being read;
 // counters remain monotonic and gauges reflect a nearby point in time.
 type Snapshot struct {
+	ActiveTransportConnections   int64          `json:"active_transport_connections"`
 	ActivePaths                  int64          `json:"active_paths"`
 	ActiveSessions               int64          `json:"active_sessions"`
+	ConnectionLimitRejections    int64          `json:"connection_limit_rejections"`
 	PathReconnects               int64          `json:"path_reconnects"`
 	SessionReconnects            int64          `json:"session_reconnects"`
 	AuthFailures                 int64          `json:"auth_failures"`
@@ -88,23 +90,25 @@ type Snapshot struct {
 // Registry stores process counters and a bounded set of per-path statistics.
 // Its zero value is ready to use.
 type Registry struct {
-	activePaths         atomic.Int64
-	activeSessions      atomic.Int64
-	pathReconnects      atomic.Int64
-	sessionReconnects   atomic.Int64
-	authFailures        atomic.Int64
-	queueDrops          atomic.Int64
-	nextPathID          atomic.Uint64
-	bytesRead           atomic.Uint64
-	bytesWritten        atomic.Uint64
-	readOperations      atomic.Uint64
-	writeOperations     atomic.Uint64
-	readErrors          atomic.Uint64
-	writeErrors         atomic.Uint64
-	writeLatencySamples atomic.Uint64
-	writeLatencyTotalNS atomic.Uint64
-	writeLatencyMaxNS   atomic.Uint64
-	kcpSNMP             *kcp.Snmp
+	activeTransportConnections atomic.Int64
+	activePaths                atomic.Int64
+	activeSessions             atomic.Int64
+	connectionLimitRejections  atomic.Int64
+	pathReconnects             atomic.Int64
+	sessionReconnects          atomic.Int64
+	authFailures               atomic.Int64
+	queueDrops                 atomic.Int64
+	nextPathID                 atomic.Uint64
+	bytesRead                  atomic.Uint64
+	bytesWritten               atomic.Uint64
+	readOperations             atomic.Uint64
+	writeOperations            atomic.Uint64
+	readErrors                 atomic.Uint64
+	writeErrors                atomic.Uint64
+	writeLatencySamples        atomic.Uint64
+	writeLatencyTotalNS        atomic.Uint64
+	writeLatencyMaxNS          atomic.Uint64
+	kcpSNMP                    *kcp.Snmp
 
 	pathsMu         sync.RWMutex
 	activePathsByID map[uint64]*Path
@@ -153,12 +157,15 @@ func (r *Registry) OpenPath(label string) *Path {
 	return path
 }
 
-func (r *Registry) SessionOpened()      { r.activeSessions.Add(1) }
-func (r *Registry) SessionClosed()      { r.activeSessions.Add(-1) }
-func (r *Registry) PathReconnected()    { r.pathReconnects.Add(1) }
-func (r *Registry) SessionReconnected() { r.sessionReconnects.Add(1) }
-func (r *Registry) AuthFailed()         { r.authFailures.Add(1) }
-func (r *Registry) QueueDropped()       { r.queueDrops.Add(1) }
+func (r *Registry) TransportConnectionOpened() { r.activeTransportConnections.Add(1) }
+func (r *Registry) TransportConnectionClosed() { r.activeTransportConnections.Add(-1) }
+func (r *Registry) ConnectionLimitRejected()   { r.connectionLimitRejections.Add(1) }
+func (r *Registry) SessionOpened()             { r.activeSessions.Add(1) }
+func (r *Registry) SessionClosed()             { r.activeSessions.Add(-1) }
+func (r *Registry) PathReconnected()           { r.pathReconnects.Add(1) }
+func (r *Registry) SessionReconnected()        { r.sessionReconnects.Add(1) }
+func (r *Registry) AuthFailed()                { r.authFailures.Add(1) }
+func (r *Registry) QueueDropped()              { r.queueDrops.Add(1) }
 
 // Close stops accounting for a path as active. It is safe to call repeatedly.
 func (p *Path) Close() {
@@ -287,8 +294,10 @@ func (r *Registry) pathSnapshots() (int64, []PathSnapshot) {
 func (r *Registry) Snapshot() Snapshot {
 	activePaths, paths := r.pathSnapshots()
 	return Snapshot{
+		ActiveTransportConnections:   r.activeTransportConnections.Load(),
 		ActivePaths:                  activePaths,
 		ActiveSessions:               r.activeSessions.Load(),
+		ConnectionLimitRejections:    r.connectionLimitRejections.Load(),
 		PathReconnects:               r.pathReconnects.Load(),
 		SessionReconnects:            r.sessionReconnects.Load(),
 		AuthFailures:                 r.authFailures.Load(),
