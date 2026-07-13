@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/l1ch666/vk-turn-proxy/metrics"
 	"github.com/l1ch666/vk-turn-proxy/tcputil"
 	"github.com/xtaci/smux"
 )
@@ -16,6 +17,15 @@ import (
 type recordingKCPWindow struct {
 	mu      sync.Mutex
 	windows []int
+}
+
+func newLifecycleTestBackendGate(t *testing.T) *backendGate {
+	t.Helper()
+	gate, err := newBackendGate(16, 8, &metrics.Registry{})
+	if err != nil {
+		t.Fatalf("create backend gate: %v", err)
+	}
+	return gate
 }
 
 func (r *recordingKCPWindow) SetWindowSize(send, receive int) {
@@ -83,9 +93,10 @@ func TestServeSmuxSessionReturnsOnContextCancel(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	gate := newLifecycleTestBackendGate(t)
 	done := make(chan struct{})
 	go func() {
-		serveSmuxSession(ctx, serverSession, "127.0.0.1:1")
+		serveSmuxSession(ctx, serverSession, "127.0.0.1:1", gate)
 		close(done)
 	}()
 	cancel()
@@ -97,6 +108,104 @@ func TestServeSmuxSessionReturnsOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestServeSmuxSessionRejectsStreamsOverBackendLimit(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	serverSession, err := smux.Server(serverConn, tcputil.DefaultSmuxConfig())
+	if err != nil {
+		t.Fatalf("failed to create smux server: %v", err)
+	}
+	clientSession, err := smux.Client(clientConn, tcputil.DefaultSmuxConfig())
+	if err != nil {
+		_ = serverSession.Close()
+		t.Fatalf("failed to create smux client: %v", err)
+	}
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for backend: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = backendListener.Close()
+		_ = clientSession.Close()
+		_ = serverSession.Close()
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+
+	accepted := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, acceptError := backendListener.Accept()
+		if acceptError != nil {
+			acceptErr <- acceptError
+			return
+		}
+		accepted <- conn
+	}()
+
+	registry := &metrics.Registry{}
+	gate, err := newBackendGate(1, 1, registry)
+	if err != nil {
+		t.Fatalf("create backend gate: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan struct{})
+	go func() {
+		serveSmuxSession(ctx, serverSession, backendListener.Addr().String(), gate)
+		close(serveDone)
+	}()
+
+	first, err := clientSession.OpenStream()
+	if err != nil {
+		t.Fatalf("open first stream: %v", err)
+	}
+	defer func() { _ = first.Close() }()
+	if _, err := first.Write([]byte{1}); err != nil {
+		t.Fatalf("write first stream: %v", err)
+	}
+	var backendConn net.Conn
+	select {
+	case backendConn = <-accepted:
+		defer func() { _ = backendConn.Close() }()
+	case err := <-acceptErr:
+		t.Fatalf("accept backend connection: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first stream did not open a backend connection")
+	}
+	if got := registry.Snapshot().ActiveBackendStreams; got != 1 {
+		t.Fatalf("active backend streams = %d, want 1", got)
+	}
+
+	second, err := clientSession.OpenStream()
+	if err != nil {
+		t.Fatalf("open second stream: %v", err)
+	}
+	defer func() { _ = second.Close() }()
+	_, _ = second.Write([]byte{2})
+	deadline := time.Now().Add(2 * time.Second)
+	for registry.Snapshot().BackendLimitRejections != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := registry.Snapshot().BackendLimitRejections; got != 1 {
+		t.Fatalf("backend limit rejections = %d, want 1", got)
+	}
+	if err := second.SetReadDeadline(time.Now().Add(time.Second)); err == nil {
+		if _, err := second.Read(make([]byte, 1)); err == nil {
+			t.Fatal("rejected stream remained readable")
+		}
+	}
+
+	cancel()
+	select {
+	case <-serveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveSmuxSession did not stop after cancellation")
+	}
+	if got := registry.Snapshot().ActiveBackendStreams; got != 0 {
+		t.Fatalf("active backend streams after shutdown = %d, want 0", got)
+	}
+}
+
 func TestHandleVLESSConnectionReturnsWhileWaitingForKCP(t *testing.T) {
 	serverConn, peerConn := net.Pipe()
 	t.Cleanup(func() {
@@ -105,9 +214,10 @@ func TestHandleVLESSConnectionReturnsWhileWaitingForKCP(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	gate := newLifecycleTestBackendGate(t)
 	done := make(chan struct{})
 	go func() {
-		handleVLESSConnection(ctx, serverConn, "127.0.0.1:1")
+		handleVLESSConnection(ctx, serverConn, "127.0.0.1:1", gate)
 		close(done)
 	}()
 	cancel()

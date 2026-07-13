@@ -67,9 +67,11 @@ type KCPSnapshot struct {
 // counters remain monotonic and gauges reflect a nearby point in time.
 type Snapshot struct {
 	ActiveTransportConnections   int64          `json:"active_transport_connections"`
+	ActiveBackendStreams         int64          `json:"active_backend_streams"`
 	ActivePaths                  int64          `json:"active_paths"`
 	ActiveSessions               int64          `json:"active_sessions"`
 	ConnectionLimitRejections    int64          `json:"connection_limit_rejections"`
+	BackendLimitRejections       int64          `json:"backend_limit_rejections"`
 	PathReconnects               int64          `json:"path_reconnects"`
 	SessionReconnects            int64          `json:"session_reconnects"`
 	AuthFailures                 int64          `json:"auth_failures"`
@@ -91,9 +93,11 @@ type Snapshot struct {
 // Its zero value is ready to use.
 type Registry struct {
 	activeTransportConnections atomic.Int64
+	activeBackendStreams       atomic.Int64
 	activePaths                atomic.Int64
 	activeSessions             atomic.Int64
 	connectionLimitRejections  atomic.Int64
+	backendLimitRejections     atomic.Int64
 	pathReconnects             atomic.Int64
 	sessionReconnects          atomic.Int64
 	authFailures               atomic.Int64
@@ -160,6 +164,9 @@ func (r *Registry) OpenPath(label string) *Path {
 func (r *Registry) TransportConnectionOpened() { r.activeTransportConnections.Add(1) }
 func (r *Registry) TransportConnectionClosed() { r.activeTransportConnections.Add(-1) }
 func (r *Registry) ConnectionLimitRejected()   { r.connectionLimitRejections.Add(1) }
+func (r *Registry) BackendStreamOpened()       { r.activeBackendStreams.Add(1) }
+func (r *Registry) BackendStreamClosed()       { r.activeBackendStreams.Add(-1) }
+func (r *Registry) BackendLimitRejected()      { r.backendLimitRejections.Add(1) }
 func (r *Registry) SessionOpened()             { r.activeSessions.Add(1) }
 func (r *Registry) SessionClosed()             { r.activeSessions.Add(-1) }
 func (r *Registry) PathReconnected()           { r.pathReconnects.Add(1) }
@@ -295,9 +302,11 @@ func (r *Registry) Snapshot() Snapshot {
 	activePaths, paths := r.pathSnapshots()
 	return Snapshot{
 		ActiveTransportConnections:   r.activeTransportConnections.Load(),
+		ActiveBackendStreams:         r.activeBackendStreams.Load(),
 		ActivePaths:                  activePaths,
 		ActiveSessions:               r.activeSessions.Load(),
 		ConnectionLimitRejections:    r.connectionLimitRejections.Load(),
+		BackendLimitRejections:       r.backendLimitRejections.Load(),
 		PathReconnects:               r.pathReconnects.Load(),
 		SessionReconnects:            r.sessionReconnects.Load(),
 		AuthFailures:                 r.authFailures.Load(),

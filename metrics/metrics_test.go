@@ -15,8 +15,10 @@ func TestRegistrySnapshot(t *testing.T) {
 	path2 := registry.OpenPath("bond/path-2")
 	path1.Close()
 	registry.TransportConnectionOpened()
+	registry.BackendStreamOpened()
 	registry.SessionOpened()
 	registry.ConnectionLimitRejected()
+	registry.BackendLimitRejected()
 	registry.PathReconnected()
 	registry.SessionReconnected()
 	registry.AuthFailed()
@@ -25,18 +27,22 @@ func TestRegistrySnapshot(t *testing.T) {
 	got := registry.Snapshot()
 	want := Snapshot{
 		ActiveTransportConnections: 1,
+		ActiveBackendStreams:       1,
 		ActivePaths:                1,
 		ActiveSessions:             1,
 		ConnectionLimitRejections:  1,
+		BackendLimitRejections:     1,
 		PathReconnects:             1,
 		SessionReconnects:          1,
 		AuthFailures:               1,
 		QueueDrops:                 1,
 	}
 	if got.ActiveTransportConnections != want.ActiveTransportConnections ||
+		got.ActiveBackendStreams != want.ActiveBackendStreams ||
 		got.ActivePaths != want.ActivePaths ||
 		got.ActiveSessions != want.ActiveSessions ||
 		got.ConnectionLimitRejections != want.ConnectionLimitRejections ||
+		got.BackendLimitRejections != want.BackendLimitRejections ||
 		got.PathReconnects != want.PathReconnects ||
 		got.SessionReconnects != want.SessionReconnects ||
 		got.AuthFailures != want.AuthFailures ||
@@ -51,8 +57,10 @@ func TestRegistrySnapshot(t *testing.T) {
 	}
 	path2.Close()
 	registry.TransportConnectionClosed()
-	if got := registry.Snapshot().ActiveTransportConnections; got != 0 {
-		t.Fatalf("active transport connections after close = %d, want 0", got)
+	registry.BackendStreamClosed()
+	closedSnapshot := registry.Snapshot()
+	if closedSnapshot.ActiveTransportConnections != 0 || closedSnapshot.ActiveBackendStreams != 0 {
+		t.Fatalf("active resources after close = %+v", closedSnapshot)
 	}
 }
 
@@ -69,6 +77,7 @@ func TestRegistryConcurrentCounters(t *testing.T) {
 				registry.PathReconnected()
 				registry.QueueDropped()
 				registry.ConnectionLimitRejected()
+				registry.BackendLimitRejected()
 			}
 		}()
 	}
@@ -76,7 +85,8 @@ func TestRegistryConcurrentCounters(t *testing.T) {
 
 	snapshot := registry.Snapshot()
 	want := int64(workers * iterations)
-	if snapshot.PathReconnects != want || snapshot.QueueDrops != want || snapshot.ConnectionLimitRejections != want {
+	if snapshot.PathReconnects != want || snapshot.QueueDrops != want ||
+		snapshot.ConnectionLimitRejections != want || snapshot.BackendLimitRejections != want {
 		t.Fatalf("concurrent snapshot = %+v, want reconnects/drops/rejections %d", snapshot, want)
 	}
 }

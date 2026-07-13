@@ -101,11 +101,14 @@ The active engineering roadmap is tracked in
 - The server admits at most 256 active DTLS transports and 64 per source IP by
   default. Tune `-max-connections` and `-max-connections-per-ip` together when a
   deployment legitimately needs more bonded paths.
+- VLESS forwarding is also bounded to 1024 active backend streams globally and
+  256 per smux session by default. Tune `-max-backend-connections` and
+  `-max-streams-per-session` together for larger deployments.
 - DTLS encrypts the data plane, but pinned peer identity or PSK/mTLS
   authentication is not implemented yet. Do not assume protection against an
   active man-in-the-middle until that roadmap item is complete.
-- Release signing, checksums, SBOM/provenance, backend/smux concurrency limits,
-  and hardened service/container definitions are still roadmap items.
+- Release signing, checksums, SBOM/provenance, and hardened service/container
+  definitions are still roadmap items.
 
 ## Development checks
 

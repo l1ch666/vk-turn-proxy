@@ -73,6 +73,9 @@ On the server, `active_transport_connections` includes admitted DTLS
 connections and bonded paths from admission through final close.
 `connection_limit_rejections` is the cumulative number refused by the global
 or per-IP admission limit (including peers with an unusable remote address).
+`active_backend_streams` covers accepted smux streams while they are waiting
+for a dial or using a TCP backend connection. `backend_limit_rejections`
+counts streams closed because either the global or per-session bound was full.
 
 The nested `kcp` object is a process-wide snapshot from `kcp-go`; the library
 does not expose these counters per session. `retransmitted_segments` is the

@@ -8,6 +8,7 @@ import (
 
 type MetricDelta struct {
 	ConnectionLimitRejections    int64           `json:"connection_limit_rejections"`
+	BackendLimitRejections       int64           `json:"backend_limit_rejections"`
 	PathReconnects               int64           `json:"path_reconnects"`
 	SessionReconnects            int64           `json:"session_reconnects"`
 	AuthFailures                 int64           `json:"auth_failures"`
@@ -56,6 +57,7 @@ func DiffMetrics(before, after metrics.Snapshot) (MetricDelta, error) {
 		target        *int64
 	}{
 		{"connection_limit_rejections", before.ConnectionLimitRejections, after.ConnectionLimitRejections, &delta.ConnectionLimitRejections},
+		{"backend_limit_rejections", before.BackendLimitRejections, after.BackendLimitRejections, &delta.BackendLimitRejections},
 		{"path_reconnects", before.PathReconnects, after.PathReconnects, &delta.PathReconnects},
 		{"session_reconnects", before.SessionReconnects, after.SessionReconnects, &delta.SessionReconnects},
 		{"auth_failures", before.AuthFailures, after.AuthFailures, &delta.AuthFailures},

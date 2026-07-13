@@ -122,14 +122,14 @@ func TestConnectionLimiterConcurrentCapacity(t *testing.T) {
 	}
 }
 
-func TestShouldLogConnectionRejectionUsesPowersOfTwo(t *testing.T) {
+func TestShouldLogResourceRejectionUsesPowersOfTwo(t *testing.T) {
 	for _, count := range []uint64{1, 2, 4, 8, 1024} {
-		if !shouldLogConnectionRejection(count) {
+		if !shouldLogResourceRejection(count) {
 			t.Fatalf("count %d should be logged", count)
 		}
 	}
 	for _, count := range []uint64{0, 3, 5, 6, 1023} {
-		if shouldLogConnectionRejection(count) {
+		if shouldLogResourceRejection(count) {
 			t.Fatalf("count %d should be suppressed", count)
 		}
 	}

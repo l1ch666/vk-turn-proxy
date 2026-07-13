@@ -52,9 +52,9 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 ## Phase 5: security, packaging, and releases
 
 - [ ] Authenticate the DTLS peer with a pinned server identity and client PSK or mTLS.
-- [ ] Add global/per-IP resource limits and bounded backend/smux concurrency.
+- [x] Add global/per-IP resource limits and bounded backend/smux concurrency.
   - [x] Bound active DTLS transports globally and per source IP, including the full lifetime of handed-off bond paths.
-  - [ ] Bound accepted smux streams and concurrent TCP backend dials/connections across sessions.
+  - [x] Bound accepted smux streams and concurrent TCP backend dials/connections across sessions.
 - [x] Make unimplemented compatibility flags fail safely.
 - [ ] Run releases only from commits that passed required CI checks.
 - [ ] Publish checksums, SBOM, provenance, and signed artifacts.

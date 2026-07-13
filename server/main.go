@@ -32,6 +32,8 @@ func main() {
 	genWrapKey := flag.Bool("gen-wrap-key", false, "unsupported compatibility flag; exits with an error")
 	maxConnections := flag.Int("max-connections", defaultMaxTransportConnections, "maximum active DTLS transport connections")
 	maxConnectionsPerIP := flag.Int("max-connections-per-ip", defaultMaxTransportConnectionsPerIP, "maximum active DTLS transport connections per source IP")
+	maxBackendConnections := flag.Int("max-backend-connections", defaultMaxBackendConnections, "maximum active VLESS backend streams across all sessions")
+	maxStreamsPerSession := flag.Int("max-streams-per-session", defaultMaxStreamsPerSession, "maximum active VLESS streams in one smux session")
 	diagnosticOptions := diagnostics.RegisterFlags(flag.CommandLine)
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
@@ -42,11 +44,16 @@ func main() {
 	if limitErr != nil {
 		log.Fatalf("invalid connection limits: %s", limitErr)
 	}
+	backendGate, backendLimitErr := newBackendGate(*maxBackendConnections, *maxStreamsPerSession, &metrics.Process)
+	if backendLimitErr != nil {
+		log.Fatalf("invalid backend limits: %s", backendLimitErr)
+	}
 	if err := tcputil.ValidateTuning(); err != nil {
 		log.Fatalf("invalid transport tuning: %s", err)
 	}
 	log.Printf("tuning: %s", tcputil.TuningSummary())
 	log.Printf("connection limits: total=%d per-ip=%d", *maxConnections, *maxConnectionsPerIP)
+	log.Printf("backend limits: total=%d per-session=%d", *maxBackendConnections, *maxStreamsPerSession)
 	diagnosticConfig, diagnosticErr := diagnosticOptions.Config()
 	if diagnosticErr != nil {
 		log.Fatalf("invalid diagnostics configuration: %s", diagnosticErr)
@@ -113,7 +120,7 @@ func main() {
 	fmt.Println("Listening")
 	var bondManager *vlessBondManager
 	if *vlessMode && *vlessBond {
-		bondManager = newVLESSBondManager(*connect)
+		bondManager = newVLESSBondManagerWithGate(*connect, backendGate)
 	}
 
 	wg1 := sync.WaitGroup{}
@@ -138,7 +145,7 @@ func main() {
 		if lease == nil {
 			metrics.Process.ConnectionLimitRejected()
 			count := connectionRejections.Add(1)
-			if shouldLogConnectionRejection(count) {
+			if shouldLogResourceRejection(count) {
 				log.Printf("transport connection rejected from %v: %s (total rejections: %d)", conn.RemoteAddr(), rejection, count)
 			}
 			_ = conn.Close()
@@ -197,7 +204,7 @@ func main() {
 					log.Printf("VLESS bond path accepted: %s\n", conn.RemoteAddr())
 					return
 				}
-				handleVLESSConnection(ctx, dtlsConn, *connect)
+				handleVLESSConnection(ctx, dtlsConn, *connect, backendGate)
 			} else {
 				handleUDPConnection(ctx, conn, *connect)
 			}
@@ -230,6 +237,7 @@ func enabledText(enabled bool) string {
 
 type vlessBondManager struct {
 	connectAddr string
+	backendGate *backendGate
 	mu          sync.Mutex
 	groups      map[string]*vlessBondGroup
 	wg          sync.WaitGroup
@@ -237,8 +245,13 @@ type vlessBondManager struct {
 }
 
 func newVLESSBondManager(connectAddr string) *vlessBondManager {
+	return newVLESSBondManagerWithGate(connectAddr, defaultBackendGate())
+}
+
+func newVLESSBondManagerWithGate(connectAddr string, gate *backendGate) *vlessBondManager {
 	return &vlessBondManager{
 		connectAddr: connectAddr,
+		backendGate: gate,
 		groups:      make(map[string]*vlessBondGroup),
 		runGroup: func(ctx context.Context, group *vlessBondGroup, onDone func()) {
 			group.run(ctx, onDone)
@@ -283,6 +296,7 @@ func (m *vlessBondManager) add(ctx context.Context, conn net.Conn, cleanup func(
 		group = &vlessBondGroup{
 			id:          bondID,
 			connectAddr: m.connectAddr,
+			backendGate: m.backendGate,
 			pc:          tcputil.NewBondedPacketConn("vless-bond-server:" + bondID),
 			hello:       hello,
 		}
@@ -331,6 +345,7 @@ func (m *vlessBondManager) Wait() {
 type vlessBondGroup struct {
 	id          string
 	connectAddr string
+	backendGate *backendGate
 	pc          *tcputil.BondedPacketConn
 	hello       tcputil.BondHello
 	startOnce   sync.Once
@@ -466,7 +481,7 @@ func (g *vlessBondGroup) run(ctx context.Context, onDone func()) {
 	defer metrics.Process.SessionClosed()
 	log.Printf("smux session established (vless bond server, id=%s)", g.shortID())
 
-	serveSmuxSession(ctx, smuxSess, g.connectAddr)
+	serveSmuxSession(ctx, smuxSess, g.connectAddr, g.backendGate)
 }
 
 func (g *vlessBondGroup) shortID() string {
@@ -567,7 +582,7 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 
 // handleVLESSConnection creates a KCP+smux session over DTLS and forwards
 // each smux stream as a TCP connection to the backend (Xray/VLESS).
-func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr string) {
+func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr string, gate *backendGate) {
 	closeDone := make(chan struct{})
 	stopClose := context.AfterFunc(ctx, func() {
 		defer close(closeDone)
@@ -607,10 +622,16 @@ func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr s
 	defer metrics.Process.SessionClosed()
 	log.Printf("smux session established (server)")
 
-	serveSmuxSession(ctx, smuxSess, connectAddr)
+	serveSmuxSession(ctx, smuxSess, connectAddr, gate)
 }
 
-func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr string) {
+func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr string, gate *backendGate) {
+	if gate == nil {
+		log.Printf("backend limits are unavailable; closing smux session")
+		_ = smuxSess.Close()
+		return
+	}
+	sessionLimiter := gate.NewSessionLimiter()
 	sessionCtx, cancelSession := context.WithCancel(ctx)
 	closeDone := make(chan struct{})
 	stopClose := context.AfterFunc(sessionCtx, func() {
@@ -637,10 +658,19 @@ func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr s
 			}
 			break
 		}
+		lease, rejection, rejectionCount := gate.Acquire(sessionLimiter)
+		if lease == nil {
+			if shouldLogResourceRejection(rejectionCount) {
+				log.Printf("smux stream rejected: %s (total backend rejections: %d)", rejection, rejectionCount)
+			}
+			_ = stream.Close()
+			continue
+		}
 
 		wg.Add(1)
-		go func(s *smux.Stream) {
+		go func(s *smux.Stream, lease *backendLease) {
 			defer wg.Done()
+			defer lease.Release()
 
 			defer func() {
 				if err := s.Close(); err != nil && err != smux.ErrGoAway {
@@ -664,7 +694,7 @@ func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr s
 
 			// Bidirectional copy
 			pipeConn(sessionCtx, s, backendConn)
-		}(stream)
+		}(stream, lease)
 	}
 	cancelSession()
 	wg.Wait()

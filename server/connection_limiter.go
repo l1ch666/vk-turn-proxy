@@ -127,6 +127,6 @@ func remoteIPKey(remote net.Addr) (string, error) {
 	return "", fmt.Errorf("remote address has no valid IP")
 }
 
-func shouldLogConnectionRejection(count uint64) bool {
+func shouldLogResourceRejection(count uint64) bool {
 	return count != 0 && count&(count-1) == 0
 }

@@ -146,5 +146,7 @@ inside a measurement window.
   KCP/FEC counters are process-wide.
 - Use the median of at least three comparable measured runs. Retain the raw
   files and examine reconnects, queue drops, write errors, retransmissions, and
-  FEC recovery before accepting a throughput change.
+  FEC recovery before accepting a throughput change. Connection/backend limit
+  rejections make a run invalid unless the limit itself is the variable under
+  test.
 - Do not claim an improvement from a single best run.
