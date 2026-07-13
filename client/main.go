@@ -38,6 +38,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/l1ch666/vk-turn-proxy/diagnostics"
+	"github.com/l1ch666/vk-turn-proxy/dtlsauth"
 	"github.com/l1ch666/vk-turn-proxy/metrics"
 	"github.com/l1ch666/vk-turn-proxy/tcputil"
 	"github.com/pion/dtls/v3"
@@ -1435,8 +1436,12 @@ func getYandexCreds(link string) (string, string, string, error) {
 	}
 }
 
-func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
+func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr, authentication dtlsauth.ClientAuthentication) (net.Conn, error) {
 	certificate, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		return nil, err
+	}
+	options, err := clientDTLSOptions(certificate, authentication)
 	if err != nil {
 		return nil, err
 	}
@@ -1453,11 +1458,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 	dtlsConn, err := dtls.ClientWithOptions(
 		conn,
 		peer,
-		dtls.WithCertificates(certificate),
-		dtls.WithInsecureSkipVerify(true),
-		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
-		dtls.WithCipherSuites(dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
-		dtls.WithConnectionIDGenerator(dtls.OnlySendCIDGenerator()),
+		options...,
 	)
 	if err != nil {
 		return nil, err
@@ -1470,7 +1471,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 	return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) error {
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, authentication dtlsauth.ClientAuthentication, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) error {
 	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
 
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
@@ -1486,7 +1487,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 			}
 		}
 	}()
-	dtlsConn, err1 := dtlsFunc(dtlsctx, conn1, peer)
+	dtlsConn, err1 := dtlsFunc(dtlsctx, conn1, peer, authentication)
 	if err1 != nil {
 		return fmt.Errorf("failed to connect DTLS: %s", err1)
 	}
@@ -1565,11 +1566,12 @@ func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 type turnParams struct {
-	host     string
-	port     string
-	link     string
-	udp      bool
-	getCreds getCredsFunc
+	host               string
+	port               string
+	link               string
+	udp                bool
+	getCreds           getCredsFunc
+	dtlsAuthentication dtlsauth.ClientAuthentication
 }
 
 // bridgeTURNPackets forwards packets between a long-lived DTLS packet pipe and
@@ -1769,13 +1771,13 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	bridgeTURNPackets(ctx, relayConn, conn2, peer, streamID)
 }
 
-func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
+func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, authentication dtlsauth.ClientAuthentication, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			err := oneDtlsConnection(ctx, peer, listenConn, inboundChan, connchan, okchan, streamID)
+			err := oneDtlsConnection(ctx, peer, authentication, listenConn, inboundChan, connchan, okchan, streamID)
 			if err != nil {
 				if time.Now().Unix() < globalCaptchaLockout.Load() && strings.Contains(err.Error(), "context deadline exceeded") {
 					continue
@@ -1876,6 +1878,8 @@ func main() {
 	wrap := flag.Bool("wrap", false, "unsupported compatibility flag; exits with an error")
 	wrapKey := flag.String("wrap-key", "", "unsupported compatibility flag; exits with an error")
 	genWrapKey := flag.Bool("gen-wrap-key", false, "unsupported compatibility flag; exits with an error")
+	dtlsServerFingerprint := flag.String("dtls-server-fingerprint", "", "required SHA-256 fingerprint of the DTLS server leaf certificate")
+	dtlsInsecureSkipVerify := flag.Bool("dtls-insecure-skip-verify", false, "disable DTLS server authentication (unsafe compatibility override)")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	tlsProfileFlag := flag.String("tls-profile", "", "tls-client profile for VK auth/captcha (e.g. confirmed_android_2, mesh_android, chrome_146); env VK_TURN_TLS_PROFILE overrides")
@@ -1885,6 +1889,14 @@ func main() {
 	tlsClientProfileName = *tlsProfileFlag
 	if err := validateClientCompatibilityFlags(*noDTLS, *dnsMode, *wrap, *wrapKey, *genWrapKey); err != nil {
 		log.Fatalf("%s", err)
+	}
+	dtlsAuthentication, dtlsAuthenticationErr := dtlsauth.NewClientAuthentication(*dtlsServerFingerprint, *dtlsInsecureSkipVerify)
+	if dtlsAuthenticationErr != nil {
+		log.Fatalf("invalid DTLS authentication: %s", dtlsAuthenticationErr)
+	}
+	log.Printf("DTLS server authentication: %s", dtlsAuthentication.Description())
+	if dtlsAuthentication.Insecure() {
+		log.Printf("WARNING: DTLS server authentication is disabled; the connection is vulnerable to an active man-in-the-middle")
 	}
 	if err := tcputil.ValidateTuning(); err != nil {
 		log.Fatalf("invalid transport tuning: %s", err)
@@ -1958,11 +1970,12 @@ func main() {
 	}
 
 	params := &turnParams{
-		host:     *host,
-		port:     *port,
-		link:     link,
-		udp:      *udp,
-		getCreds: getCreds,
+		host:               *host,
+		port:               *port,
+		link:               link,
+		udp:                *udp,
+		getCreds:           getCreds,
+		dtlsAuthentication: dtlsAuthentication,
 	}
 	if _, err := diagnostics.Start(ctx, diagnosticConfig, &metrics.Process); err != nil {
 		log.Fatalf("start diagnostics: %s", err)
@@ -2036,7 +2049,7 @@ func main() {
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, connchan, okchan, 0)
+		oneDtlsConnectionLoop(ctx, peer, params.dtlsAuthentication, listenConn, inboundChan, connchan, okchan, 0)
 	}()
 	wg1.Add(1)
 	go func() {
@@ -2054,7 +2067,7 @@ func main() {
 		wg1.Add(1)
 		go func(streamID int) {
 			defer wg1.Done()
-			oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, cchan, nil, streamID)
+			oneDtlsConnectionLoop(ctx, peer, params.dtlsAuthentication, listenConn, inboundChan, cchan, nil, streamID)
 		}(i)
 		wg1.Add(1)
 		go func(streamID int) {
@@ -2620,13 +2633,12 @@ func createDTLSConnection(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 		return nil, nil, fmt.Errorf("generate cert: %w", err)
 	}
 	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer}
-	dtlsConn, err := dtls.ClientWithOptions(dtlsPC, peer,
-		dtls.WithCertificates(certificate),
-		dtls.WithInsecureSkipVerify(true),
-		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
-		dtls.WithCipherSuites(dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
-		dtls.WithConnectionIDGenerator(dtls.OnlySendCIDGenerator()),
-	)
+	dtlsOptions, err := clientDTLSOptions(certificate, tp.dtlsAuthentication)
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("DTLS authentication config: %w", err)
+	}
+	dtlsConn, err := dtls.ClientWithOptions(dtlsPC, peer, dtlsOptions...)
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("DTLS client create: %w", err)

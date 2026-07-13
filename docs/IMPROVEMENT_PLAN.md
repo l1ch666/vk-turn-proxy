@@ -52,6 +52,9 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 ## Phase 5: security, packaging, and releases
 
 - [ ] Authenticate the DTLS peer with a pinned server identity and client PSK or mTLS.
+  - [x] Require the client to pin the server leaf certificate's SHA-256 fingerprint in every transport mode.
+  - [x] Support a persistent server certificate/key pair and fail closed on malformed identity configuration.
+  - [ ] Authenticate clients with a PSK or mTLS and define a safe credential-rotation procedure.
 - [x] Add global/per-IP resource limits and bounded backend/smux concurrency.
   - [x] Bound active DTLS transports globally and per source IP, including the full lifetime of handed-off bond paths.
   - [x] Bound accepted smux streams and concurrent TCP backend dials/connections across sessions.

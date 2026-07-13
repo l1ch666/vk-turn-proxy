@@ -60,12 +60,18 @@ backend:
   -connect 127.0.0.1:51820
 ```
 
+Copy the `DTLS server certificate SHA-256 fingerprint` from the server log over
+an authenticated channel. For a stable identity across restarts, configure the
+server with `-dtls-cert-file` and `-dtls-key-file` as described in
+[docs/DTLS_IDENTITY.md](docs/DTLS_IDENTITY.md).
+
 Start the client with exactly one supported conference invite link:
 
 ```sh
 ./bin/vk-turn-client \
   -listen 127.0.0.1:51820 \
   -peer SERVER_IP:56000 \
+  -dtls-server-fingerprint 'SHA256_FINGERPRINT_FROM_SERVER' \
   -vk-link 'https://vk.com/call/join/REDACTED' \
   -n 10
 ```
@@ -104,9 +110,13 @@ The active engineering roadmap is tracked in
 - VLESS forwarding is also bounded to 1024 active backend streams globally and
   256 per smux session by default. Tune `-max-backend-connections` and
   `-max-streams-per-session` together for larger deployments.
-- DTLS encrypts the data plane, but pinned peer identity or PSK/mTLS
-  authentication is not implemented yet. Do not assume protection against an
-  active man-in-the-middle until that roadmap item is complete.
+- The client requires the server certificate's pinned SHA-256 fingerprint by
+  default and fails the DTLS handshake if it changes. The explicit
+  `-dtls-insecure-skip-verify` migration override restores the old unsafe
+  behavior and must not be used in a normal deployment.
+- DTLS client authentication (PSK or mTLS) is not implemented yet. Protect the
+  server address and keep the connection limits enabled until mutual
+  authentication is added.
 - Release signing, checksums, SBOM/provenance, and hardened service/container
   definitions are still roadmap items.
 

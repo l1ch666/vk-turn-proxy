@@ -1,6 +1,8 @@
 dist/
 /bin/
 /benchmarks/results/
+/dtls-server-cert.pem
+/dtls-server-key.pem
 *.exe
 *.test
 *.out

@@ -42,14 +42,18 @@ mixing an iperf3 UDP control/data topology into the result.
      -vless -n 10 \
      -listen 127.0.0.1:9000 \
      -peer VPS_IP:56000 \
+     -dtls-server-fingerprint 'SHA256_FINGERPRINT_FROM_SERVER' \
      -vk-link 'REDACTED_INVITE_LINK' \
      -diagnostics-listen 127.0.0.1:6060 \
      -diagnostics-token-file ./diagnostics.token
    ```
 
    Add `-udp` for the TURN-UDP profile. Add `-vless-bond` to both proxy
-   binaries for a bond profile. Token generation and endpoint security are
-   documented in [DIAGNOSTICS.md](DIAGNOSTICS.md).
+   binaries for a bond profile. Keep the same persistent server certificate
+   for every comparable run; a changed pin indicates a different deployment
+   configuration. DTLS identity setup is documented in
+   [DTLS_IDENTITY.md](DTLS_IDENTITY.md), and token generation and endpoint
+   security are documented in [DIAGNOSTICS.md](DIAGNOSTICS.md).
 
 Wait until the client log shows an established session. The harness also fails
 early when diagnostics reports zero active sessions (or zero active paths for a

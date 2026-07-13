@@ -18,7 +18,6 @@ import (
 	"github.com/l1ch666/vk-turn-proxy/metrics"
 	"github.com/l1ch666/vk-turn-proxy/tcputil"
 	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/xtaci/smux"
 )
 
@@ -34,6 +33,8 @@ func main() {
 	maxConnectionsPerIP := flag.Int("max-connections-per-ip", defaultMaxTransportConnectionsPerIP, "maximum active DTLS transport connections per source IP")
 	maxBackendConnections := flag.Int("max-backend-connections", defaultMaxBackendConnections, "maximum active VLESS backend streams across all sessions")
 	maxStreamsPerSession := flag.Int("max-streams-per-session", defaultMaxStreamsPerSession, "maximum active VLESS streams in one smux session")
+	dtlsCertificateFile := flag.String("dtls-cert-file", "", "PEM server certificate for a persistent DTLS identity (requires -dtls-key-file)")
+	dtlsKeyFile := flag.String("dtls-key-file", "", "PEM private key for the DTLS server certificate (requires -dtls-cert-file)")
 	diagnosticOptions := diagnostics.RegisterFlags(flag.CommandLine)
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
@@ -60,6 +61,14 @@ func main() {
 	}
 	if err := validateServerVLESSFlags(*vlessMode, *vlessBond); err != nil {
 		log.Fatalf("%s", err)
+	}
+	dtlsIdentity, identityErr := loadServerDTLSIdentity(*dtlsCertificateFile, *dtlsKeyFile)
+	if identityErr != nil {
+		log.Fatalf("invalid DTLS identity: %s", identityErr)
+	}
+	log.Printf("DTLS server certificate SHA-256 fingerprint: %s", dtlsIdentity.fingerprint)
+	if dtlsIdentity.ephemeral {
+		log.Printf("WARNING: using an ephemeral DTLS identity; the fingerprint changes on restart (set -dtls-cert-file and -dtls-key-file for a persistent identity)")
 	}
 	log.Printf("vless mode: %s", enabledText(*vlessMode))
 	if *vlessMode {
@@ -91,12 +100,6 @@ func main() {
 	if len(*connect) == 0 {
 		log.Panicf("server address is required")
 	}
-	// Generate a certificate and private key to secure the connection
-	certificate, genErr := selfsign.GenerateSelfSigned()
-	if genErr != nil {
-		panic(genErr)
-	}
-
 	//
 	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
 	//
@@ -105,9 +108,9 @@ func main() {
 	listener, err := dtls.ListenWithOptions(
 		"udp",
 		addr,
-		dtls.WithCertificates(certificate),
+		dtls.WithCertificates(dtlsIdentity.certificate),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
-		dtls.WithCipherSuites(dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
+		dtls.WithCipherSuites(dtlsIdentity.cipherSuite),
 		dtls.WithConnectionIDGenerator(dtls.RandomCIDGenerator(8)),
 	)
 	if err != nil {
