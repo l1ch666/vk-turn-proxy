@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/l1ch666/vk-turn-proxy/tcputil"
+	"github.com/l1ch666/vk-turn-proxy/v2/tcputil"
 )
 
 func TestValidateClientVLESSFlagsRequiresVLESSForBond(t *testing.T) {
@@ -58,6 +58,38 @@ func TestNormalizeStreamsPerCredentialDefaultsToCoreValue(t *testing.T) {
 func TestNormalizeStreamsPerCredentialKeepsConfiguredValue(t *testing.T) {
 	if got := normalizeStreamsPerCredential(4); got != 4 {
 		t.Fatalf("normalizeStreamsPerCredential(4) = %d, want 4", got)
+	}
+}
+
+func TestNormalizeUDPPathCountPreventsEndpointRoamingByDefault(t *testing.T) {
+	if got := normalizeUDPPathCount(false, 10, false); got != 1 {
+		t.Fatalf("safe UDP path count = %d, want 1", got)
+	}
+	if got := normalizeUDPPathCount(false, 10, true); got != 10 {
+		t.Fatalf("explicit legacy UDP path count = %d, want 10", got)
+	}
+	if got := normalizeUDPPathCount(true, 10, false); got != 10 {
+		t.Fatalf("VLESS path count = %d, want 10", got)
+	}
+}
+
+func TestValidateClientListenAddressFailsClosedOutsideLoopback(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:9000", "[::1]:9000"} {
+		if err := validateClientListenAddress(address, false); err != nil {
+			t.Errorf("loopback address %q rejected: %v", address, err)
+		}
+	}
+	for _, address := range []string{"0.0.0.0:9000", "[::]:9000", "localhost:9000"} {
+		if err := validateClientListenAddress(address, false); err == nil {
+			t.Errorf("non-literal-loopback address %q accepted", address)
+		}
+		if err := validateClientListenAddress(address, true); err != nil {
+			t.Errorf("explicit unsafe address %q rejected: %v", address, err)
+		}
+	}
+	if err := validateClientListenAddress("missing-port", false); err == nil ||
+		!strings.Contains(err.Error(), "missing port") {
+		t.Fatalf("malformed address error = %v", err)
 	}
 }
 

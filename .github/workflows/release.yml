@@ -5,15 +5,107 @@ permissions:
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    tags:
+      - "v2.*.*"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
+  quality:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag and provenance
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must match v2.MINOR.PATCH with numeric components: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          git fetch --force --tags origin
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" refs/remotes/origin/main; then
+            echo "Release commit is not reachable from origin/main: $RELEASE_SHA" >&2
+            exit 1
+          fi
+          highest_release_tag="$(
+            git tag --list 'v2.*.*' |
+              grep -E '^v2\.[0-9]+\.[0-9]+$' |
+              LC_ALL=C sort -V |
+              tail -n 1
+          )"
+          if [ "$RELEASE_TAG" != "$highest_release_tag" ]; then
+            echo "Refusing to move mutable release tags backwards: newest tag is $highest_release_tag" >&2
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          files="$(gofmt -l .)"
+          test -z "$files" || {
+            printf 'Files need gofmt:\n%s\n' "$files"
+            exit 1
+          }
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          args: --timeout=5m ./...
+
+      - name: Scan reachable vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Audit third-party licenses
+        id: license-audit
+        continue-on-error: true
+        run: bash scripts/audit-third-party-licenses.sh legal-materials
+
+      - name: Upload license audit materials
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: legal-materials
+          path: legal-materials
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce third-party license audit
+        if: ${{ steps.license-audit.outcome != 'success' }}
+        run: |
+          echo "Third-party license audit failed; inspect the legal-materials artifact." >&2
+          exit 1
+
   build:
-    name: Build binaries
+    name: Package ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: quality
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - goos: linux
@@ -23,7 +115,7 @@ jobs:
             goarch: arm64
             cgo: 0
           - goos: linux
-            goarch: 386
+            goarch: "386"
             cgo: 0
           - goos: linux
             goarch: arm
@@ -57,7 +149,7 @@ jobs:
             goarch: arm64
             cgo: 0
           - goos: windows
-            goarch: 386
+            goarch: "386"
             cgo: 0
           - goos: android
             goarch: arm64
@@ -65,6 +157,7 @@ jobs:
             api: 21
           - goos: android
             goarch: arm
+            goarm: "7"
             cgo: 1
             api: 21
           - goos: freebsd
@@ -72,16 +165,16 @@ jobs:
             cgo: 0
 
     steps:
-      - name: Check out code
+      - name: Check out tagged source
         uses: actions/checkout@v6
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.5"
+          go-version-file: go.mod
+          cache: true
 
-      # Install Android NDK only for android rows
-      - name: Setup Android NDK
+      - name: Set up Android NDK
         if: matrix.goos == 'android'
         id: setup-ndk
         uses: nttld/setup-ndk@v1
@@ -89,226 +182,131 @@ jobs:
           ndk-version: r26d
           add-to-path: false
 
-      - name: Build
+      - name: Download audited legal materials
+        uses: actions/download-artifact@v7
+        with:
+          name: legal-materials
+          path: THIRD_PARTY_LICENSES
+
+      - name: Build and package
+        shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          GOMIPS: ${{ matrix.gomips }}
           GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
           CGO_ENABLED: ${{ matrix.cgo }}
           ANDROID_API: ${{ matrix.api }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          VERSION: ${{ github.ref_name }}
         run: |
-          echo "Building for $GOOS/$GOARCH${GOARM:+/arm$GOARM} (CGO_ENABLED=$CGO_ENABLED)"
-
-          if [ "$GOOS" = "android" ]; then
-            if [ -z "$ANDROID_NDK_HOME" ]; then
-              echo "ANDROID_NDK_HOME is not set – did setup-ndk run?"
-              exit 1
-            fi
-
-            TOOLCHAIN_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-            if [ "$GOARCH" = "arm64" ]; then
-              export CC="$TOOLCHAIN_BIN/aarch64-linux-android${ANDROID_API}-clang"
-            elif [ "$GOARCH" = "arm" ]; then
-              export CC="$TOOLCHAIN_BIN/armv7a-linux-androideabi${ANDROID_API}-clang"
-            else
-              echo "Unsupported ANDROID GOARCH=$GOARCH"
-              exit 1
-            fi
-
-            echo "Using Android NDK CC=$CC"
+          set -eu
+          if [ "$GOOS" = android ]; then
+            toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            case "$GOARCH" in
+              arm64) export CC="$toolchain/aarch64-linux-android${ANDROID_API}-clang" ;;
+              arm) export CC="$toolchain/armv7a-linux-androideabi${ANDROID_API}-clang" ;;
+              *) echo "Unsupported Android architecture: $GOARCH" >&2; exit 1 ;;
+            esac
           fi
 
-          mkdir -p dist
+          extension=
+          [ "$GOOS" != windows ] || extension=.exe
+          variant=
+          [ -z "${GOARM:-}" ] || variant="-v${GOARM}"
+          package_name="vk-turn-proxy-${GITHUB_REF_NAME}-${GOOS}-${GOARCH}${variant}"
+          linker_flags="-s -w"
+          # Pion's Android interface enumeration depends on wlynxg/anet,
+          # whose documented Go 1.23+ build contract requires this check.
+          [ "$GOOS" != android ] || linker_flags="$linker_flags -checklinkname=0"
 
-          # Set extension for windows
-          if [ "${GOOS}" = "windows" ]; then
-            EXT=.exe
+          mkdir -p "package" "release"
+          go build -trimpath -ldflags="$linker_flags" -o "package/vk-turn-client${extension}" ./client
+          go build -trimpath -ldflags="$linker_flags" -o "package/vk-turn-server${extension}" ./server
+          go build -trimpath -ldflags="$linker_flags" -o "package/vk-turn-bench${extension}" ./cmd/vk-turn-bench
+          cp LICENSE NOTICE README.md docs/RELEASE_LEGAL.md package/
+          cp -R THIRD_PARTY_LICENSES package/
+
+          case "$GOOS" in
+            linux)
+              cp routes.sh package/
+              chmod 0755 package/routes.sh
+              cp "package/vk-turn-server" "release/server-linux-${GOARCH}"
+              ;;
+            darwin)
+              cp routes-macos.sh package/
+              chmod 0755 package/routes-macos.sh
+              ;;
+            windows)
+              cp routes.ps1 package/
+              ;;
+          esac
+
+          if [ "$GOOS" = windows ]; then
+            (cd package && zip -9 -r "../release/${package_name}.zip" .)
           else
-            EXT=
+            tar -czf "release/${package_name}.tar.gz" -C package .
           fi
 
-          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM GOMIPS=$GOMIPS \
-          go build -ldflags "-s -w -checklinkname=0" -trimpath \
-            -o "dist/client-${GOOS}-${GOARCH}${EXT}" \
-            ./client
-
-          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM GOMIPS=$GOMIPS \
-          go build -ldflags "-s -w -checklinkname=0" -trimpath \
-            -o "dist/server-${GOOS}-${GOARCH}${EXT}" \
-            ./server
-
-      - name: Upload artifact
+      - name: Upload package
+        if: ${{ vars.RELEASE_LEGAL_APPROVED == 'true' }}
         uses: actions/upload-artifact@v6
         with:
-          name: good-turn-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/**
+          name: package-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.goarm }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
 
-  release:
-    name: Create GitHub Release
+  publish:
+    name: Publish GitHub release
     needs: build
+    if: ${{ vars.RELEASE_LEGAL_APPROVED == 'true' }}
     runs-on: ubuntu-latest
-    outputs:
-      should_release: ${{ steps.meta.outputs.should_release }}
-      tag_name: ${{ steps.meta.outputs.tag_name }}
     permissions:
       contents: write
     steps:
-      - name: Check out code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Download build artifacts
+      - name: Download packages
         uses: actions/download-artifact@v7
         with:
-          path: dist
+          pattern: package-*
+          path: release
+          merge-multiple: true
 
-      - name: Prepare release metadata
-        id: meta
-        run: |
-          LATEST_TAG="$(git tag -l | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
-          PREFIX=""
-          BASE_VERSION="$LATEST_TAG"
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum * > SHA256SUMS
 
-          if [ -z "$LATEST_TAG" ]; then
-            BASE_VERSION="0.0.0"
-          elif [ "${LATEST_TAG#v}" != "$LATEST_TAG" ]; then
-            PREFIX="v"
-            BASE_VERSION="${LATEST_TAG#v}"
-          fi
-
-          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
-
-          if [ -n "$LATEST_TAG" ]; then
-            RANGE="$LATEST_TAG..HEAD"
-          else
-            RANGE="HEAD"
-          fi
-
-          COMMITS="$(git log --no-merges --format='%s' "$RANGE")"
-          BUMP=""
-
-          if printf '%s\n' "$COMMITS" | grep -Eiq '^break([(:! ]|$)'; then
-            BUMP="major"
-            MAJOR=$((MAJOR + 1))
-            MINOR=0
-            PATCH=0
-          elif printf '%s\n' "$COMMITS" | grep -Eiq '^feat([(:! ]|$)'; then
-            BUMP="minor"
-            MINOR=$((MINOR + 1))
-            PATCH=0
-          elif printf '%s\n' "$COMMITS" | grep -Eiq '^fix([(:! ]|$)'; then
-            BUMP="patch"
-            PATCH=$((PATCH + 1))
-          fi
-
-          NEXT_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          NEXT_TAG="${PREFIX}${NEXT_VERSION}"
-
-          {
-            echo "previous_tag=$LATEST_TAG"
-            echo "range=$RANGE"
-            echo "bump=$BUMP"
-            echo "should_release=$([ -n "$BUMP" ] && echo true || echo false)"
-            echo "tag_name=$NEXT_TAG"
-            echo "release_name=$NEXT_TAG"
-            echo "body_path=release-notes.md"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Generate release notes from commit messages
-        id: notes
-        if: steps.meta.outputs.should_release == 'true'
-        env:
-          PREVIOUS_TAG: ${{ steps.meta.outputs.previous_tag }}
-          NEXT_TAG: ${{ steps.meta.outputs.tag_name }}
-          BUMP: ${{ steps.meta.outputs.bump }}
-          RANGE: ${{ steps.meta.outputs.range }}
-        run: |
-          strip_prefix() {
-            sed -E 's/^(feat|fix|break)([(!:]|[[:space:]])+[[:space:]]*//I'
-          }
-
-          FEATURES="$(git log --no-merges --format='%s (%h)' "$RANGE" | grep -Ei '^feat([(:! ]|$)' | strip_prefix | LC_ALL=C sort -f || true)"
-          FIXES="$(git log --no-merges --format='%s (%h)' "$RANGE" | grep -Ei '^fix([(:! ]|$)' | strip_prefix | LC_ALL=C sort -f || true)"
-          BREAKING="$(git log --no-merges --format='%s (%h)' "$RANGE" | grep -Ei '^break([(:! ]|$)' | strip_prefix | LC_ALL=C sort -f || true)"
-
-          {
-            echo "body_path=release-notes.md"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            if [ -n "$BREAKING" ]; then
-              echo "### Breaking Changes"
-              echo
-              printf '%s\n' "$BREAKING" | sed 's/^/- /'
-              echo
-            fi
-
-            if [ -n "$FEATURES" ]; then
-              echo "### Features"
-              echo
-              printf '%s\n' "$FEATURES" | sed 's/^/- /'
-              echo
-            fi
-
-            if [ -n "$FIXES" ]; then
-              echo "### Bug Fixes"
-              echo
-              printf '%s\n' "$FIXES" | sed 's/^/- /'
-              echo
-            fi
-          } > release-notes.md
-
-      - name: Create Release
-        if: steps.meta.outputs.should_release == 'true'
-        uses: softprops/action-gh-release@v2
+      - name: Create release without overwriting assets
+        uses: softprops/action-gh-release@v3
         with:
-          # upload every file in dist/ including nested files
-          files: |
-            dist/**
-          tag_name: ${{ steps.meta.outputs.tag_name }}
-          target_commitish: ${{ github.sha }}
-          name: ${{ steps.meta.outputs.release_name }}
-          body_path: ${{ steps.meta.outputs.body_path }}
-          overwrite_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Skip release when no semantic commit is found
-        if: steps.meta.outputs.should_release != 'true'
-        run: |
-          echo "No new semantic release created."
-          echo "Add a commit starting with break, feat, or fix after the latest tag."
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          overwrite_files: false
 
   docker:
     name: Publish Docker image
-    needs: release
-    if: needs.release.outputs.should_release == 'true'
+    needs: publish
+    if: ${{ vars.RELEASE_LEGAL_APPROVED == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
-      - name: Check out code
+      - name: Check out tagged source
         uses: actions/checkout@v6
+
+      - name: Download audited legal materials
+        uses: actions/download-artifact@v7
+        with:
+          name: legal-materials
+          path: THIRD_PARTY_LICENSES
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-
-      - name: Prepare image name
-        id: image
-        env:
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          echo "name=ghcr.io/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -317,16 +315,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
+      - name: Prepare image metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ steps.image.outputs.name }}
+          images: ghcr.io/${{ github.repository }}
           tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-            type=raw,value=${{ needs.release.outputs.tag_name }}
 
-      - name: Build and push Docker image
+      - name: Build and push image
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -335,3 +335,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true

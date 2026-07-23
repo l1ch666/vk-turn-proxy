@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/cbeuw/connutil"
-	"github.com/l1ch666/vk-turn-proxy/dtlsauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/dtlsauth"
 )
 
 type failingHandshakePacketConn struct {
@@ -48,7 +48,7 @@ func TestDTLSFuncClosesTransportAfterHandshakeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dtlsFunc(ctx, packetConn, peer, authentication); err == nil {
+	if _, err := dtlsFunc(ctx, packetConn, peer, authentication, nil); err == nil {
 		t.Fatal("expected DTLS handshake failure")
 	}
 	if !packetConn.closed.Load() {

@@ -1,14 +1,59 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/xtaci/smux"
 )
+
+type failingPooledSession struct {
+	err error
+}
+
+func (session failingPooledSession) OpenStream() (*smux.Stream, error) {
+	return nil, session.err
+}
+
+func (failingPooledSession) IsClosed() bool  { return false }
+func (failingPooledSession) NumStreams() int { return 0 }
+func (failingPooledSession) Close() error    { return nil }
+
+type blockingPooledSession struct {
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newBlockingPooledSession() *blockingPooledSession {
+	return &blockingPooledSession{closed: make(chan struct{})}
+}
+
+func (session *blockingPooledSession) OpenStream() (*smux.Stream, error) {
+	<-session.closed
+	return nil, net.ErrClosed
+}
+
+func (session *blockingPooledSession) IsClosed() bool {
+	select {
+	case <-session.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (*blockingPooledSession) NumStreams() int { return 0 }
+
+func (session *blockingPooledSession) Close() error {
+	session.closeOnce.Do(func() { close(session.closed) })
+	return nil
+}
 
 // newSmuxPair returns a connected client/server smux session pair over an
 // in-memory pipe, plus a cleanup func.
@@ -148,4 +193,87 @@ func TestPickLeastLoadedSkipsClosed(t *testing.T) {
 			t.Fatalf("pick %d: expected the live session, got the closed one", i)
 		}
 	}
+}
+
+func TestOpenStreamTriesAnotherSessionAfterFailure(t *testing.T) {
+	client, server, cleanup := newSmuxPair(t)
+	defer cleanup()
+	accepted := make(chan *smux.Stream, 1)
+	go func() {
+		stream, err := server.AcceptStream()
+		if err == nil {
+			accepted <- stream
+		}
+	}()
+
+	pool := &sessionPool{}
+	pool.add(failingPooledSession{err: errors.New("stalled path")})
+	pool.add(client)
+	stream, err := pool.openStream(context.Background(), time.Second)
+	if err != nil {
+		t.Fatalf("openStream did not fail over: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	select {
+	case acceptedStream := <-accepted:
+		_ = acceptedStream.Close()
+	case <-time.After(time.Second):
+		t.Fatal("fallback session did not receive the stream")
+	}
+}
+
+func TestOpenStreamBoundsStalledSessionAndFailsOver(t *testing.T) {
+	client, server, cleanup := newSmuxPair(t)
+	defer cleanup()
+	accepted := make(chan *smux.Stream, 1)
+	go func() {
+		stream, err := server.AcceptStream()
+		if err == nil {
+			accepted <- stream
+		}
+	}()
+
+	stalled := newBlockingPooledSession()
+	pool := &sessionPool{}
+	pool.add(client)
+	pool.add(stalled)
+
+	started := time.Now()
+	stream, err := pool.openStreamWithAttemptTimeout(
+		context.Background(),
+		500*time.Millisecond,
+		40*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("openStream did not fail over from stalled session: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("stalled session failover took %s, want at most 300ms", elapsed)
+	}
+	if !stalled.IsClosed() {
+		t.Fatal("stalled session was not closed after attempt timeout")
+	}
+
+	select {
+	case acceptedStream := <-accepted:
+		_ = acceptedStream.Close()
+	case <-time.After(time.Second):
+		t.Fatal("fallback session did not receive the stream")
+	}
+}
+
+func TestOpenStreamWaitsBrieflyForSession(t *testing.T) {
+	client, _, cleanup := newSmuxPair(t)
+	defer cleanup()
+	pool := &sessionPool{}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		pool.add(client)
+	}()
+	stream, err := pool.openStream(context.Background(), time.Second)
+	if err != nil {
+		t.Fatalf("openStream did not wait for a session: %v", err)
+	}
+	_ = stream.Close()
 }

@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	neturl "net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,10 +39,11 @@ import (
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/l1ch666/vk-turn-proxy/diagnostics"
-	"github.com/l1ch666/vk-turn-proxy/dtlsauth"
-	"github.com/l1ch666/vk-turn-proxy/metrics"
-	"github.com/l1ch666/vk-turn-proxy/tcputil"
+	"github.com/l1ch666/vk-turn-proxy/v2/diagnostics"
+	"github.com/l1ch666/vk-turn-proxy/v2/dtlsauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/sessionauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/tcputil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
@@ -63,7 +66,6 @@ type directListenConfig struct {
 
 // Global state trackers
 var (
-	activeLocalPeer      atomic.Value
 	globalCaptchaLockout atomic.Int64
 	connectedStreams     atomic.Int32
 	globalAppCancel      context.CancelFunc
@@ -122,8 +124,10 @@ type UDPPacket struct {
 }
 
 var packetPool = sync.Pool{
-	New: func() any { return &UDPPacket{Data: make([]byte, 2048)} },
+	New: func() any { return &UDPPacket{Data: make([]byte, udpPacketBufferSize)} },
 }
+
+const udpPacketBufferSize = 2048
 
 func newDirectNet() transport.Net {
 	return directNet{}
@@ -235,29 +239,6 @@ func generateBrowserFp(profile Profile) string {
 	data := profile.UserAgent + profile.SecChUa + "1920x1080x24" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	h := md5.Sum([]byte(data))
 	return hex.EncodeToString(h[:])
-}
-
-func getCustomNetDialer() net.Dialer {
-	return net.Dialer{
-		Timeout:   20 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				var d net.Dialer
-				dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
-				var lastErr error
-				for _, dns := range dnsServers {
-					conn, err := d.DialContext(ctx, "udp", dns)
-					if err == nil {
-						return conn, nil
-					}
-					lastErr = err
-				}
-				return nil, lastErr
-			},
-		},
-	}
 }
 
 // endregion
@@ -435,7 +416,11 @@ func fetchCaptchaBootstrap(ctx context.Context, redirectURI string, client tlscl
 		_ = Body.Close()
 	}(resp.Body)
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBodyLimited(
+		resp.Body,
+		maxCaptchaBootstrapResponseBytes,
+		"captcha bootstrap response",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -460,7 +445,7 @@ func solvePoW(powInput string, difficulty int) string {
 var tlsClientProfileName string
 
 // defaultTLSProfile is the compile-time default profile. It can be overridden at
-// build time via -ldflags "-X github.com/l1ch666/vk-turn-proxy/client.defaultTLSProfile=mesh_android"
+// build time via -ldflags "-X github.com/l1ch666/vk-turn-proxy/v2/client.defaultTLSProfile=mesh_android"
 // to produce per-profile builds without code edits.
 var defaultTLSProfile = "confirmed_android_2"
 
@@ -538,7 +523,11 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 			_ = Body.Close()
 		}(httpResp.Body)
 
-		body, err := io.ReadAll(httpResp.Body)
+		body, err := readResponseBodyLimited(
+			httpResp.Body,
+			maxCaptchaAPIResponseBytes,
+			"captcha API response",
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -596,7 +585,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 
 	respObj, ok := checkResp["response"].(map[string]interface{})
 	if !ok {
-		return "", fmt.Errorf("invalid check response: %v", checkResp)
+		return "", responseShapeError("invalid check response", checkResp)
 	}
 	status, ok := respObj["status"].(string)
 	if !ok || status != "OK" {
@@ -878,7 +867,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		tlsclient.WithTimeoutSeconds(20),
 		tlsclient.WithClientProfile(tlsProfile),
 		tlsclient.WithCookieJar(jar),
-		tlsclient.WithDialer(getCustomNetDialer()),
+		tlsclient.WithDialContext(dialer.DialContext),
 	)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to initialize tls_client: %w", err)
@@ -923,7 +912,11 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 			}
 		}()
 
-		body, err := io.ReadAll(httpResp.Body)
+		body, err := readResponseBodyLimited(
+			httpResp.Body,
+			maxVKAPIResponseBytes,
+			"VK API response",
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -943,11 +936,11 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 	}
 	dataMap, ok := resp["data"].(map[string]interface{})
 	if !ok {
-		return "", "", "", fmt.Errorf("unexpected anon token response: %v", resp)
+		return "", "", "", responseShapeError("unexpected anon token response", resp)
 	}
 	token1, ok := dataMap["access_token"].(string)
 	if !ok {
-		return "", "", "", fmt.Errorf("missing access_token in response: %v", resp)
+		return "", "", "", responseShapeError("missing access_token in response", resp)
 	}
 
 	vkDelayRandom(100, 150)
@@ -1070,11 +1063,11 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 		respMap, okLoop := resp["response"].(map[string]interface{})
 		if !okLoop {
-			return "", "", "", fmt.Errorf("unexpected getAnonymousToken response: %v", resp)
+			return "", "", "", responseShapeError("unexpected getAnonymousToken response", resp)
 		}
 		token2, okLoop = respMap["token"].(string)
 		if !okLoop {
-			return "", "", "", fmt.Errorf("missing token in response: %v", resp)
+			return "", "", "", responseShapeError("missing token in response", resp)
 		}
 		break
 	}
@@ -1090,7 +1083,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 	}
 	token3, ok := resp["session_key"].(string)
 	if !ok {
-		return "", "", "", fmt.Errorf("missing session_key in response: %v", resp)
+		return "", "", "", responseShapeError("missing session_key in response", resp)
 	}
 
 	vkDelayRandom(100, 150)
@@ -1104,7 +1097,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 	tsRaw, ok := resp["turn_server"].(map[string]interface{})
 	if !ok {
-		return "", "", "", fmt.Errorf("missing turn_server in response: %v", resp)
+		return "", "", "", responseShapeError("missing turn_server in response", resp)
 	}
 	user, ok := tsRaw["username"].(string)
 	if !ok {
@@ -1131,7 +1124,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 // endregion
 
-func getYandexCreds(link string) (string, string, string, error) {
+func getYandexCreds(ctx context.Context, link string) (string, string, string, error) {
 	const telemostConfHost = "cloud-api.yandex.ru"
 	telemostConfPath := fmt.Sprintf("%s%s%s", "/telemost_front/v2/telemost/conferences/https%3A%2F%2Ftelemost.yandex.ru%2Fj%2F", link, "/connection?next_gen_media_platform_allowed=false")
 
@@ -1260,7 +1253,7 @@ func getYandexCreds(link string) (string, string, string, error) {
 		Transport: tr,
 	}
 	defer client.CloseIdleConnections()
-	req, err := http.NewRequest("GET", endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -1281,15 +1274,20 @@ func getYandexCreds(link string) (string, string, string, error) {
 		}
 	}()
 	if resp.StatusCode != http.StatusOK {
-		readBody, err2 := io.ReadAll(resp.Body)
-		if err2 != nil {
-			return "", "", "", fmt.Errorf("GetConference: status=%s (failed to read body: %v)", resp.Status, err2)
-		}
-		return "", "", "", fmt.Errorf("GetConference: status=%s body=%s", resp.Status, string(readBody))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		return "", "", "", fmt.Errorf("GetConference: status=%s", resp.Status)
 	}
 
+	body, err := readResponseBodyLimited(
+		resp.Body,
+		maxConferenceResponseBytes,
+		"conference response",
+	)
+	if err != nil {
+		return "", "", "", err
+	}
 	var result ConferenceResponse
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err = json.Unmarshal(body, &result); err != nil {
 		return "", "", "", fmt.Errorf("decode conf: %v", err)
 	}
 	data := WSSData{
@@ -1302,12 +1300,12 @@ func getYandexCreds(link string) (string, string, string, error) {
 	h.Set("Origin", "https://telemost.yandex.ru")
 	h.Set("User-Agent", profile.UserAgent)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	websocketCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
 	dialer := websocket.Dialer{}
 	var conn *websocket.Conn
-	conn, resp, err = dialer.DialContext(ctx, data.Wss, h)
+	conn, resp, err = dialer.DialContext(websocketCtx, data.Wss, h)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
@@ -1385,8 +1383,7 @@ func getYandexCreds(link string) (string, string, string, error) {
 	}
 
 	if isDebug {
-		b, _ := json.MarshalIndent(req1, "", "  ")
-		log.Printf("Sending HELLO:\n%s", string(b))
+		log.Printf("Sending WSS HELLO (credentials and room identifiers redacted)")
 	}
 
 	if err := conn.WriteJSON(req1); err != nil {
@@ -1403,11 +1400,7 @@ func getYandexCreds(link string) (string, string, string, error) {
 			return "", "", "", fmt.Errorf("ws read: %w", err)
 		}
 		if isDebug {
-			s := string(msg)
-			if len(s) > 800 {
-				s = s[:800] + "...(truncated)"
-			}
-			log.Printf("WSS recv: %s", s)
+			log.Printf("WSS recv: %d bytes (payload redacted)", len(msg))
 		}
 
 		var ack WSSAck
@@ -1436,7 +1429,13 @@ func getYandexCreds(link string) (string, string, string, error) {
 	}
 }
 
-func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr, authentication dtlsauth.ClientAuthentication) (net.Conn, error) {
+func dtlsFunc(
+	ctx context.Context,
+	conn net.PacketConn,
+	peer *net.UDPAddr,
+	authentication dtlsauth.ClientAuthentication,
+	clientAuthToken *sessionauth.Token,
+) (net.Conn, error) {
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
 		return nil, err
@@ -1468,11 +1467,19 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr, authe
 		_ = dtlsConn.Close()
 		return nil, err
 	}
+	if clientAuthToken != nil {
+		if err := sessionauth.Authenticate(ctx1, dtlsConn, *clientAuthToken); err != nil {
+			_ = dtlsConn.Close()
+			return nil, fmt.Errorf("authenticate client: %w", err)
+		}
+	}
 	return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, authentication dtlsauth.ClientAuthentication, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) error {
-	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, authentication dtlsauth.ClientAuthentication, clientAuthToken *sessionauth.Token, listenConn net.PacketConn, localPeer *localPeerPin, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) error {
+	if !waitContextDelay(ctx, time.Duration(rand.Intn(400)+100)*time.Millisecond) {
+		return ctx.Err()
+	}
 
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
 	conn1, conn2 := connutil.AsyncPacketPipe()
@@ -1487,9 +1494,9 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, authentication dt
 			}
 		}
 	}()
-	dtlsConn, err1 := dtlsFunc(dtlsctx, conn1, peer, authentication)
+	dtlsConn, err1 := dtlsFunc(dtlsctx, conn1, peer, authentication, clientAuthToken)
 	if err1 != nil {
-		return fmt.Errorf("failed to connect DTLS: %s", err1)
+		return fmt.Errorf("failed to connect DTLS: %w", err1)
 	}
 	defer func() {
 		if closeErr := dtlsConn.Close(); closeErr != nil {
@@ -1509,7 +1516,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, authentication dt
 	}
 
 	wg := sync.WaitGroup{}
-	wg.Add(1)
+	wg.Add(2)
 	context.AfterFunc(dtlsctx, func() {
 		if err := dtlsConn.SetDeadline(time.Now()); err != nil {
 			log.Printf("[STREAM %d] Warning: SetDeadline failed: %v", streamID, err)
@@ -1517,14 +1524,28 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, authentication dt
 	})
 
 	go func() {
+		defer wg.Done()
 		defer dtlscancel()
 		for {
+			if dtlsctx.Err() != nil {
+				return
+			}
 			select {
 			case <-dtlsctx.Done():
 				return
-			case pkt := <-inboundChan:
-				_, _ = dtlsConn.Write(pkt.Data[:pkt.N])
+			case pkt, ok := <-inboundChan:
+				if !ok {
+					return
+				}
+				packetSize := pkt.N
+				n, writeErr := dtlsConn.Write(pkt.Data[:packetSize])
 				packetPool.Put(pkt)
+				if writeErr != nil || n != packetSize {
+					if dtlsctx.Err() == nil {
+						log.Printf("[STREAM %d] failed to write DTLS packet: wrote %d/%d: %v", streamID, n, packetSize, writeErr)
+					}
+					return
+				}
 			}
 		}
 	}()
@@ -1532,7 +1553,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, authentication dt
 	go func() {
 		defer wg.Done()
 		defer dtlscancel()
-		buf := make([]byte, 1600)
+		buf := make([]byte, udpPacketBufferSize)
 		for {
 			n, err1 := dtlsConn.Read(buf)
 			if err1 != nil {
@@ -1540,11 +1561,9 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, authentication dt
 			}
 
 			// Send back to the active WG client
-			if peerAddr := activeLocalPeer.Load(); peerAddr != nil {
-				if addr, ok := peerAddr.(net.Addr); ok {
-					if _, err := listenConn.WriteTo(buf[:n], addr); err != nil {
-						log.Printf("[STREAM %d] failed to forward packet to local peer: %v", streamID, err)
-					}
+			if peerAddr := localPeer.Current(); peerAddr != nil {
+				if _, err := listenConn.WriteTo(buf[:n], peerAddr); err != nil {
+					log.Printf("[STREAM %d] failed to forward packet to local peer: %v", streamID, err)
 				}
 			}
 		}
@@ -1572,6 +1591,7 @@ type turnParams struct {
 	udp                bool
 	getCreds           getCredsFunc
 	dtlsAuthentication dtlsauth.ClientAuthentication
+	clientAuthToken    *sessionauth.Token
 }
 
 // bridgeTURNPackets forwards packets between a long-lived DTLS packet pipe and
@@ -1601,7 +1621,7 @@ func bridgeTURNPackets(ctx context.Context, relayConn, pipeConn net.PacketConn, 
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
-		buf := make([]byte, 1600)
+		buf := make([]byte, udpPacketBufferSize)
 		for {
 			if bridgeCtx.Err() != nil {
 				return
@@ -1622,7 +1642,7 @@ func bridgeTURNPackets(ctx context.Context, relayConn, pipeConn net.PacketConn, 
 	go func() {
 		defer wg.Done()
 		defer bridgeCancel()
-		buf := make([]byte, 1600)
+		buf := make([]byte, udpPacketBufferSize)
 		for {
 			if bridgeCtx.Err() != nil {
 				return
@@ -1657,9 +1677,12 @@ func bridgeTURNPackets(ctx context.Context, relayConn, pipeConn net.PacketConn, 
 }
 
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, streamID int, c chan<- error) {
-	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
 	var err error
 	defer func() { c <- err }()
+	if !waitContextDelay(ctx, time.Duration(rand.Intn(400)+100)*time.Millisecond) {
+		err = ctx.Err()
+		return
+	}
 	user, pass, urlTarget, err1 := turnParams.getCreds(ctx, turnParams.link, streamID)
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
@@ -1684,7 +1707,6 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		return
 	}
 	turnServerAddr = turnServerUDPAddr.String()
-	fmt.Println(turnServerUDPAddr.IP)
 	var cfg *turn.ClientConfig
 	var turnConn net.PacketConn
 	var d net.Dialer
@@ -1771,14 +1793,21 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	bridgeTURNPackets(ctx, relayConn, conn2, peer, streamID)
 }
 
-func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, authentication dtlsauth.ClientAuthentication, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
+func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, authentication dtlsauth.ClientAuthentication, clientAuthToken *sessionauth.Token, listenConn net.PacketConn, localPeer *localPeerPin, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			err := oneDtlsConnection(ctx, peer, authentication, listenConn, inboundChan, connchan, okchan, streamID)
+			err := oneDtlsConnection(ctx, peer, authentication, clientAuthToken, listenConn, localPeer, inboundChan, connchan, okchan, streamID)
 			if err != nil {
+				if errors.Is(err, sessionauth.ErrRejected) {
+					log.Printf("[STREAM %d] FATAL_CLIENT_AUTH_REJECTED: server rejected the configured client token", streamID)
+					if globalAppCancel != nil {
+						globalAppCancel()
+					}
+					return
+				}
 				if time.Now().Unix() < globalCaptchaLockout.Load() && strings.Contains(err.Error(), "context deadline exceeded") {
 					continue
 				}
@@ -1836,7 +1865,9 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 					}
 				} else {
 					log.Printf("[STREAM %d] %s", streamID, err)
-					time.Sleep(2 * time.Second)
+					if !waitContextDelay(ctx, 2*time.Second) {
+						return
+					}
 				}
 			}
 		}
@@ -1863,23 +1894,35 @@ func main() {
 	host := flag.String("turn", "", "override TURN server ip")
 	port := flag.String("port", "", "override TURN port")
 	listen := flag.String("listen", "127.0.0.1:9000", "listen on ip:port")
+	unsafeListenNonLoopback := flag.Bool(
+		"unsafe-listen-non-loopback",
+		false,
+		"allow the local UDP/TCP proxy to listen outside a literal loopback address",
+	)
 	vklink := flag.String("vk-link", "", "VK calls invite link \"https://vk.com/call/join/...\"")
 	yalink := flag.String("yandex-link", "", "Yandex telemost invite link \"https://telemost.yandex.ru/j/...\"")
 	peerAddr := flag.String("peer", "", "peer server address (host:port)")
-	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
+	n := flag.Int("n", 0, "connections to TURN (default 1 for UDP forwarding, 10 for VK VLESS, 1 for Yandex)")
 	streamsPerCred := flag.Int("streams-per-cred", defaultStreamsPerCache, "TURN streams that share one credential cache")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
+	unsafeUDPMultipath := flag.Bool(
+		"unsafe-udp-multipath",
+		false,
+		"allow multiple non-VLESS UDP paths even though separate backend source ports cause WireGuard endpoint roaming",
+	)
 	noDTLS := flag.Bool("no-dtls", false, "unsupported compatibility flag; exits with an error")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	vlessBond := flag.Bool("vless-bond", false, "VLESS bond mode: packet-level multipath across TURN/DTLS streams; requires -vless")
 	vlessBondProtocol := flag.String("vless-bond-protocol", "auto", "VLESS bond control protocol: auto, v1, or v2")
-	dnsMode := flag.String("dns", "auto", "DNS mode for VK resolver: auto or udp")
+	dnsMode := flag.String("dns", "auto", "VK resolver mode: auto (alias of udp) or udp")
 	dnsServers := flag.String("dns-servers", "", "comma-separated DNS resolvers for VK auth, with optional ports")
 	wrap := flag.Bool("wrap", false, "unsupported compatibility flag; exits with an error")
 	wrapKey := flag.String("wrap-key", "", "unsupported compatibility flag; exits with an error")
 	genWrapKey := flag.Bool("gen-wrap-key", false, "unsupported compatibility flag; exits with an error")
 	dtlsServerFingerprint := flag.String("dtls-server-fingerprint", "", "required SHA-256 fingerprint of the DTLS server leaf certificate")
 	dtlsInsecureSkipVerify := flag.Bool("dtls-insecure-skip-verify", false, "disable DTLS server authentication (unsafe compatibility override)")
+	clientAuthTokenFile := flag.String("client-auth-token-file", "", "private 64-hex-character token file used to authenticate this client")
+	unsafeDisableClientAuth := flag.Bool("unsafe-disable-client-auth", false, "skip client authentication for migration to an explicitly unauthenticated server")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	tlsProfileFlag := flag.String("tls-profile", "", "tls-client profile for VK auth/captcha (e.g. confirmed_android_2, mesh_android, chrome_146); env VK_TURN_TLS_PROFILE overrides")
@@ -1890,6 +1933,9 @@ func main() {
 	if err := validateClientCompatibilityFlags(*noDTLS, *dnsMode, *wrap, *wrapKey, *genWrapKey); err != nil {
 		log.Fatalf("%s", err)
 	}
+	if err := validateClientListenAddress(*listen, *unsafeListenNonLoopback); err != nil {
+		log.Fatalf("invalid client listen address: %s", err)
+	}
 	dtlsAuthentication, dtlsAuthenticationErr := dtlsauth.NewClientAuthentication(*dtlsServerFingerprint, *dtlsInsecureSkipVerify)
 	if dtlsAuthenticationErr != nil {
 		log.Fatalf("invalid DTLS authentication: %s", dtlsAuthenticationErr)
@@ -1897,6 +1943,20 @@ func main() {
 	log.Printf("DTLS server authentication: %s", dtlsAuthentication.Description())
 	if dtlsAuthentication.Insecure() {
 		log.Printf("WARNING: DTLS server authentication is disabled; the connection is vulnerable to an active man-in-the-middle")
+	}
+	var clientAuthToken *sessionauth.Token
+	if *unsafeDisableClientAuth {
+		if *clientAuthTokenFile != "" {
+			log.Fatalf("-client-auth-token-file and -unsafe-disable-client-auth cannot be used together")
+		}
+		log.Printf("WARNING: DTLS client authentication is disabled by explicit unsafe override")
+	} else {
+		token, tokenErr := sessionauth.LoadTokenFile(*clientAuthTokenFile)
+		if tokenErr != nil {
+			log.Fatalf("invalid client authentication token: %s", tokenErr)
+		}
+		clientAuthToken = &token
+		log.Printf("DTLS client authentication: enabled")
 	}
 	if err := tcputil.ValidateTuning(); err != nil {
 		log.Fatalf("invalid transport tuning: %s", err)
@@ -1945,21 +2005,29 @@ func main() {
 
 		dialer := dnsdialer.New(
 			dnsdialer.WithResolvers(resolvers...),
-			dnsdialer.WithStrategy(dnsdialer.Fallback{}),
-			dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
+			// Mobile networks frequently black-hole one public resolver. Race
+			// the small resolver set instead of paying a sequential timeout for
+			// every unavailable server.
+			dnsdialer.WithStrategy(dnsdialer.Race{}),
+			dnsdialer.WithTimeout(1200*time.Millisecond),
+			// Respect short-lived TURN/VK DNS answers. A ten-hour floor pinned
+			// stale relay addresses until process restart after an endpoint move.
+			dnsdialer.WithCache(100, time.Second, 5*time.Minute),
 		)
 
 		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
 			return getVkCredsCached(ctx, s, streamID, dialer)
 		}
-		if *n <= 0 {
+		if *n <= 0 && *vlessMode {
 			*n = 10
+		} else if *n <= 0 {
+			*n = 1
 		}
 	} else {
 		parts := strings.Split(*yalink, "j/")
 		link = parts[len(parts)-1]
 		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
-			return getYandexCreds(s)
+			return getYandexCreds(ctx, s)
 		}
 		if *n <= 0 {
 			*n = 1
@@ -1967,6 +2035,16 @@ func main() {
 	}
 	if idx := strings.IndexAny(link, "/?#"); idx != -1 {
 		link = link[:idx]
+	}
+	requestedPaths := *n
+	*n = normalizeUDPPathCount(*vlessMode, *n, *unsafeUDPMultipath)
+	if *n != requestedPaths {
+		log.Printf(
+			"non-VLESS UDP multipath requested with %d paths; using one path to prevent WireGuard endpoint roaming (use -unsafe-udp-multipath only for legacy testing)",
+			requestedPaths,
+		)
+	} else if !*vlessMode && *unsafeUDPMultipath && *n > 1 {
+		log.Printf("WARNING: unsafe non-VLESS UDP multipath enabled; backend endpoint roaming can cause loss and reordering")
 	}
 
 	params := &turnParams{
@@ -1976,6 +2054,7 @@ func main() {
 		udp:                *udp,
 		getCreds:           getCreds,
 		dtlsAuthentication: dtlsAuthentication,
+		clientAuthToken:    clientAuthToken,
 	}
 	if _, err := diagnostics.Start(ctx, diagnosticConfig, &metrics.Process); err != nil {
 		log.Fatalf("start diagnostics: %s", err)
@@ -2003,6 +2082,7 @@ func main() {
 
 	// Shared Worker Pool Queue for Aggregation
 	inboundChan := make(chan *UDPPacket, 2000)
+	localPeer := newLocalPeerPin(defaultLocalPeerRebindIdle)
 
 	go func() {
 		for {
@@ -2014,19 +2094,21 @@ func main() {
 			}
 			nRead, addr, err := listenConn.ReadFrom(pkt.Data)
 			if err != nil {
+				packetPool.Put(pkt)
+				if ctx.Err() == nil {
+					log.Printf("local UDP listener failed: %s", err)
+					cancel()
+				}
 				return
 			}
 
-			// Save the local WireGuard peer address
-			current := activeLocalPeer.Load()
-			if current == nil {
-				activeLocalPeer.Store(addr)
-			} else if addrStr, ok := current.(net.Addr); ok {
-				if addrStr.String() != addr.String() {
-					activeLocalPeer.Store(addr)
-				}
-			} else {
-				activeLocalPeer.Store(addr)
+			// Keep return traffic pinned while the current peer is active.
+			// A new source port may take over only after the bounded idle
+			// interval; switching on every packet would let another local (or,
+			// with an unsafe bind address, remote) sender steal the flow.
+			if !localPeer.Accept(addr, time.Now()) {
+				packetPool.Put(pkt)
+				continue
 			}
 
 			pkt.N = nRead
@@ -2042,19 +2124,20 @@ func main() {
 	}()
 
 	wg1 := sync.WaitGroup{}
-	t := time.Tick(200 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
 
 	okchan := make(chan struct{})
 	connchan := make(chan net.PacketConn)
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneDtlsConnectionLoop(ctx, peer, params.dtlsAuthentication, listenConn, inboundChan, connchan, okchan, 0)
+		oneDtlsConnectionLoop(ctx, peer, params.dtlsAuthentication, params.clientAuthToken, listenConn, localPeer, inboundChan, connchan, okchan, 0)
 	}()
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneTurnConnectionLoop(ctx, params, peer, connchan, t, 0)
+		oneTurnConnectionLoop(ctx, params, peer, connchan, ticker.C, 0)
 	}()
 
 	select {
@@ -2067,12 +2150,12 @@ func main() {
 		wg1.Add(1)
 		go func(streamID int) {
 			defer wg1.Done()
-			oneDtlsConnectionLoop(ctx, peer, params.dtlsAuthentication, listenConn, inboundChan, cchan, nil, streamID)
+			oneDtlsConnectionLoop(ctx, peer, params.dtlsAuthentication, params.clientAuthToken, listenConn, localPeer, inboundChan, cchan, nil, streamID)
 		}(i)
 		wg1.Add(1)
 		go func(streamID int) {
 			defer wg1.Done()
-			oneTurnConnectionLoop(ctx, params, peer, cchan, t, streamID)
+			oneTurnConnectionLoop(ctx, params, peer, cchan, ticker.C, streamID)
 		}(i)
 	}
 
@@ -2082,18 +2165,25 @@ func main() {
 // sessionPool manages a pool of smux sessions for round-robin TCP distribution.
 type sessionPool struct {
 	mu       sync.RWMutex
-	sessions []*smux.Session
+	sessions []pooledSmuxSession
 	counter  atomic.Uint64
 }
 
-func (p *sessionPool) add(s *smux.Session) {
+type pooledSmuxSession interface {
+	OpenStream() (*smux.Stream, error)
+	IsClosed() bool
+	NumStreams() int
+	Close() error
+}
+
+func (p *sessionPool) add(s pooledSmuxSession) {
 	p.mu.Lock()
 	p.sessions = append(p.sessions, s)
 	metrics.Process.SessionOpened()
 	p.mu.Unlock()
 }
 
-func (p *sessionPool) remove(s *smux.Session) {
+func (p *sessionPool) remove(s pooledSmuxSession) {
 	p.mu.Lock()
 	for i, sess := range p.sessions {
 		if sess == s {
@@ -2112,7 +2202,15 @@ func (p *sessionPool) remove(s *smux.Session) {
 // actual occupancy instead of a counter.
 // Round-robin (via the shared counter) breaks ties so equal-load sessions still
 // rotate. Closed sessions are skipped.
-func (p *sessionPool) pickLeastLoaded() *smux.Session {
+func (p *sessionPool) pickLeastLoaded() pooledSmuxSession {
+	candidates := p.candidates()
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[0]
+}
+
+func (p *sessionPool) candidates() []pooledSmuxSession {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	n := len(p.sessions)
@@ -2120,23 +2218,115 @@ func (p *sessionPool) pickLeastLoaded() *smux.Session {
 		return nil
 	}
 	start := int(p.counter.Add(1) % uint64(n))
-	var best *smux.Session
-	bestLoad := int(^uint(0) >> 1) // max int
+	candidates := make([]pooledSmuxSession, 0, n)
 	for i := 0; i < n; i++ {
-		s := p.sessions[(start+i)%n]
-		if s.IsClosed() {
-			continue
-		}
-		load := s.NumStreams()
-		if load < bestLoad {
-			bestLoad = load
-			best = s
-			if load == 0 {
-				break // can't do better than an idle session
-			}
+		session := p.sessions[(start+i)%n]
+		if !session.IsClosed() {
+			candidates = append(candidates, session)
 		}
 	}
-	return best
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].NumStreams() < candidates[j].NumStreams()
+	})
+	return candidates
+}
+
+type pooledStreamResult struct {
+	stream *smux.Stream
+	err    error
+}
+
+func openPooledStream(
+	ctx context.Context,
+	session pooledSmuxSession,
+	timeout time.Duration,
+) (*smux.Stream, error) {
+	result := make(chan pooledStreamResult)
+	abandoned := make(chan struct{})
+	go func() {
+		stream, err := session.OpenStream()
+		select {
+		case result <- pooledStreamResult{stream: stream, err: err}:
+		case <-abandoned:
+			if stream != nil {
+				_ = stream.Close()
+			}
+		}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case opened := <-result:
+		close(abandoned)
+		return opened.stream, opened.err
+	case <-ctx.Done():
+		close(abandoned)
+		_ = session.Close()
+		return nil, ctx.Err()
+	case <-timer.C:
+		close(abandoned)
+		// smux OpenStream can wait for its own 30-second protocol timeout.
+		// Closing the stalled session bounds the attempt and lets the pool fail
+		// over immediately; the session owner will establish a replacement.
+		_ = session.Close()
+		return nil, fmt.Errorf("smux stream open timed out after %s", timeout)
+	}
+}
+
+func (p *sessionPool) openStream(ctx context.Context, wait time.Duration) (*smux.Stream, error) {
+	return p.openStreamWithAttemptTimeout(ctx, wait, time.Second)
+}
+
+func (p *sessionPool) openStreamWithAttemptTimeout(
+	ctx context.Context,
+	wait time.Duration,
+	maxAttempt time.Duration,
+) (*smux.Stream, error) {
+	if wait <= 0 {
+		return nil, fmt.Errorf("smux stream wait must be positive")
+	}
+	if maxAttempt <= 0 {
+		return nil, fmt.Errorf("smux stream attempt timeout must be positive")
+	}
+	deadline := time.Now().Add(wait)
+	var lastErr error
+	for {
+		for _, session := range p.candidates() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			attemptTimeout := maxAttempt
+			if remaining < attemptTimeout {
+				attemptTimeout = remaining
+			}
+			stream, err := openPooledStream(ctx, session, attemptTimeout)
+			if err == nil {
+				return stream, nil
+			}
+			lastErr = err
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return nil, fmt.Errorf("all active smux sessions rejected the stream: %w", lastErr)
+			}
+			return nil, fmt.Errorf("no active smux sessions")
+		}
+		poll := 25 * time.Millisecond
+		if remaining < poll {
+			poll = remaining
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (p *sessionPool) count() int {
@@ -2172,6 +2362,30 @@ func normalizeVLESSSessionCount(streamCount int) int {
 		return 1
 	}
 	return streamCount
+}
+
+func normalizeUDPPathCount(vlessMode bool, pathCount int, unsafeMultipath bool) int {
+	if !vlessMode && pathCount > 1 && !unsafeMultipath {
+		return 1
+	}
+	return pathCount
+}
+
+func validateClientListenAddress(address string, unsafeNonLoopback bool) error {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(address))
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	if unsafeNonLoopback {
+		return nil
+	}
+	return fmt.Errorf(
+		"listen host must be a literal loopback IP; use -unsafe-listen-non-loopback only for a deliberately exposed proxy",
+	)
 }
 
 func normalizeStreamsPerCredential(streams int) int {
@@ -2312,25 +2526,18 @@ func runVLESSMode(
 			continue
 		}
 
-		sess := pool.pickLeastLoaded()
-		if sess == nil || sess.IsClosed() {
-			log.Printf("No active sessions, rejecting connection")
-			_ = tcpConn.Close()
-			continue
-		}
-
 		wgConn.Add(1)
-		go func(tc net.Conn, s *smux.Session) {
+		go func(tc net.Conn) {
 			defer wgConn.Done()
 			defer func() { _ = tc.Close() }()
-			stream, err := s.OpenStream()
+			stream, err := pool.openStream(ctx, 3*time.Second)
 			if err != nil {
 				log.Printf("smux open stream error: %s", err)
 				return
 			}
 			defer func() { _ = stream.Close() }()
 			pipe(ctx, tc, stream)
-		}(tcpConn, sess)
+		}(tcpConn)
 	}
 }
 
@@ -2363,6 +2570,13 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 
 		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer, id)
 		if err != nil {
+			if errors.Is(err, sessionauth.ErrRejected) {
+				log.Printf("[session %d] FATAL_CLIENT_AUTH_REJECTED: server rejected the configured client token", id)
+				if globalAppCancel != nil {
+					globalAppCancel()
+				}
+				return
+			}
 			if isFatalCaptchaError(err) {
 				log.Printf("[session %d] fatal captcha error; shutting down application", id)
 				if globalAppCancel != nil {
@@ -2426,6 +2640,13 @@ func maintainVLESSBondPath(
 
 		dtlsConn, cleanup, err := createDTLSConnection(ctx, tp, peer, id)
 		if err != nil {
+			if errors.Is(err, sessionauth.ErrRejected) {
+				log.Printf("[bond path %d] FATAL_CLIENT_AUTH_REJECTED: server rejected the configured client token", id)
+				if globalAppCancel != nil {
+					globalAppCancel()
+				}
+				return
+			}
 			if isFatalCaptchaError(err) {
 				log.Printf("[bond path %d] fatal captcha error; shutting down application", id)
 				if globalAppCancel != nil {
@@ -2650,6 +2871,13 @@ func createDTLSConnection(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 		cleanup()
 		return nil, nil, fmt.Errorf("DTLS handshake: %w", err)
 	}
+	if tp.clientAuthToken != nil {
+		if err = sessionauth.Authenticate(ctx2, dtlsConn, *tp.clientAuthToken); err != nil {
+			_ = dtlsConn.Close()
+			cleanup()
+			return nil, nil, fmt.Errorf("authenticate client: %w", err)
+		}
+	}
 	cleanupFns = append(cleanupFns, func() { _ = dtlsConn.Close() })
 	connectedStreams.Add(1)
 	cleanupFns = append(cleanupFns, func() { connectedStreams.Add(-1) })
@@ -2680,37 +2908,7 @@ func (r *relayPacketConn) SetWriteDeadline(t time.Time) error { return r.relay.S
 
 // pipe copies data bidirectionally between two connections.
 func pipe(ctx context.Context, c1, c2 net.Conn) {
-	ctx2, cancel := context.WithCancel(ctx)
-	context.AfterFunc(ctx2, func() {
-		if err := c1.SetDeadline(time.Now()); err != nil {
-			log.Printf("pipe: failed to set deadline c1: %v", err)
-		}
-		if err := c2.SetDeadline(time.Now()); err != nil {
-			log.Printf("pipe: failed to set deadline c2: %v", err)
-		}
-	})
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		if _, err := io.Copy(c1, c2); err != nil {
-			log.Printf("pipe: c1<-c2 copy error: %v", err)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		if _, err := io.Copy(c2, c1); err != nil {
-			log.Printf("pipe: c2<-c1 copy error: %v", err)
-		}
-	}()
-	wg.Wait()
-	if err := c1.SetDeadline(time.Time{}); err != nil {
-		log.Printf("pipe: failed to reset deadline c1: %v", err)
-	}
-	if err := c2.SetDeadline(time.Time{}); err != nil {
-		log.Printf("pipe: failed to reset deadline c2: %v", err)
+	if err := tcputil.Pipe(ctx, c1, c2); err != nil && ctx.Err() == nil {
+		log.Printf("pipe: %v", err)
 	}
 }

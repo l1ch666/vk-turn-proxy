@@ -3,6 +3,12 @@ dist/
 /benchmarks/results/
 /dtls-server-cert.pem
 /dtls-server-key.pem
+/dtls-server-identity.pem
+/client-auth-token
+/diagnostics.token
+.env
+.env.*
+*.key
 *.exe
 *.test
 *.out

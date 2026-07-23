@@ -3,7 +3,7 @@ package main
 import (
 	"crypto/tls"
 
-	"github.com/l1ch666/vk-turn-proxy/dtlsauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/dtlsauth"
 	"github.com/pion/dtls/v3"
 )
 

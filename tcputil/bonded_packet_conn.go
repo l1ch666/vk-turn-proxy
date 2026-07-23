@@ -1,7 +1,6 @@
 package tcputil
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -12,18 +11,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
 )
 
 const (
-	bondHelloV1Token = "VKTURNBOND/1"
-	bondHelloV2Token = "VKTURNBOND/2"
-	bondHelloV2Ack   = "VKTURNBOND/2 OK\n"
-	bondHelloV2Error = "ERR"
-	maxBondHelloSize = 256
-	MaxBondPaths     = 64
-	BondProtocolV1   = 1
-	BondProtocolV2   = 2
+	bondHelloV1Token          = "VKTURNBOND/1"
+	bondHelloV2Token          = "VKTURNBOND/2"
+	bondHelloV2Ack            = "VKTURNBOND/2 OK\n"
+	bondHelloV2Error          = "ERR"
+	maxBondHelloSize          = 256
+	MaxBondPaths              = 64
+	BondProtocolV1            = 1
+	BondProtocolV2            = 2
+	defaultBondEmptyPathGrace = 10 * time.Second
 )
 
 // ErrBondHelloRejected identifies an explicit V2 rejection from a new server.
@@ -86,10 +86,13 @@ type BondedPacketConn struct {
 	nextPath uint64
 	nextID   uint64
 
-	readCh    chan bondedPacket
-	stateCh   chan struct{}
-	closeOnce sync.Once
-	closed    chan struct{}
+	readCh       chan bondedPacket
+	stateCh      chan struct{}
+	closeOnce    sync.Once
+	closed       chan struct{}
+	emptyGrace   time.Duration
+	emptyTimer   *time.Timer
+	emptyExpired bool
 
 	localAddr  net.Addr
 	remoteAddr net.Addr
@@ -98,8 +101,15 @@ type BondedPacketConn struct {
 }
 
 func NewBondedPacketConn(label string) *BondedPacketConn {
+	return newBondedPacketConn(label, defaultBondEmptyPathGrace)
+}
+
+func newBondedPacketConn(label string, emptyGrace time.Duration) *BondedPacketConn {
 	if label == "" {
 		label = "vless-bond"
+	}
+	if emptyGrace <= 0 {
+		emptyGrace = defaultBondEmptyPathGrace
 	}
 	return &BondedPacketConn{
 		label:          label,
@@ -107,6 +117,7 @@ func NewBondedPacketConn(label string) *BondedPacketConn {
 		readCh:         make(chan bondedPacket, 1024),
 		stateCh:        make(chan struct{}, 1),
 		closed:         make(chan struct{}),
+		emptyGrace:     emptyGrace,
 		localAddr:      bondAddr(label + "/local"),
 		remoteAddr:     bondAddr(label + "/remote"),
 	}
@@ -133,6 +144,15 @@ func (b *BondedPacketConn) AddConn(conn net.Conn, cleanup func()) <-chan struct{
 		b.closePath(path)
 		return path.done
 	default:
+	}
+	if b.emptyExpired {
+		b.mu.Unlock()
+		b.closePath(path)
+		return path.done
+	}
+	if b.emptyTimer != nil {
+		b.emptyTimer.Stop()
+		b.emptyTimer = nil
 	}
 	b.paths = append(b.paths, path)
 	path.stats = b.metricRegistry.OpenPath(fmt.Sprintf("%s/path-%d", b.label, path.id))
@@ -177,14 +197,26 @@ func (b *BondedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	select {
+	case <-b.closed:
+		return 0, net.ErrClosed
+	default:
+	}
 
 	paths := b.snapshotPaths()
 	if len(paths) == 0 {
-		return 0, fmt.Errorf("vless bond has no active paths")
+		b.startEmptyGrace()
+		select {
+		case <-b.closed:
+			return 0, net.ErrClosed
+		default:
+			// KCP owns reliability. Dropping during the bounded reconnect grace
+			// keeps its socket alive so retransmission can resume on a new path.
+			return len(p), nil
+		}
 	}
 
 	start := int(atomic.AddUint64(&b.nextPath, 1)-1) % len(paths)
-	var lastErr error
 	for attempt := 0; attempt < len(paths); attempt++ {
 		path := paths[(start+attempt)%len(paths)]
 		if deadline, ok := b.writeDeadline.Load().(time.Time); ok {
@@ -212,21 +244,23 @@ func (b *BondedPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		// under normal loss, collapsing throughput to one stream (~5 Mbit) and
 		// causing reconnect churn. On a transient error we keep the path and just
 		// try the next one for THIS packet; KCP retransmits anything truly lost.
-		lastErr = err
 		if isPermanentPathError(err) {
 			b.removePath(path, true)
 		}
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("vless bond has no writable paths")
+	select {
+	case <-b.closed:
+		return 0, net.ErrClosed
+	default:
 	}
-	// Report the packet as "sent" for a transient miss: KCP owns reliability and
-	// will retransmit. Returning an error here would propagate up and can abort the
-	// KCP session on what is only a momentary, recoverable condition.
-	if !isPermanentPathError(lastErr) {
-		return len(p), nil
+	if b.Count() == 0 {
+		b.startEmptyGrace()
 	}
-	return 0, lastErr
+	// Every currently usable path missed this packet. KCP retransmits it; an
+	// error here would permanently terminate the KCP socket. Permanent path
+	// errors have already removed those paths, and an empty bond is bounded by
+	// startEmptyGrace.
+	return len(p), nil
 }
 
 // isPermanentPathError reports whether a path write error means the underlying
@@ -266,6 +300,12 @@ func isPermanentPathError(err error) bool {
 func (b *BondedPacketConn) Close() error {
 	b.closeOnce.Do(func() {
 		close(b.closed)
+		b.mu.Lock()
+		if b.emptyTimer != nil {
+			b.emptyTimer.Stop()
+			b.emptyTimer = nil
+		}
+		b.mu.Unlock()
 		b.notifyStateChanged()
 		for _, path := range b.snapshotPaths() {
 			b.removePath(path, true)
@@ -357,6 +397,9 @@ func (b *BondedPacketConn) removePath(path *bondedPath, closeConn bool) {
 	b.mu.Unlock()
 
 	if removed {
+		if b.Count() == 0 {
+			b.startEmptyGrace()
+		}
 		b.notifyStateChanged()
 		if closeConn {
 			_ = path.conn.Close()
@@ -366,6 +409,33 @@ func (b *BondedPacketConn) removePath(path *bondedPath, closeConn bool) {
 		}
 		close(path.done)
 	}
+}
+
+func (b *BondedPacketConn) startEmptyGrace() {
+	b.mu.Lock()
+	if len(b.paths) != 0 || b.emptyTimer != nil || b.emptyExpired {
+		b.mu.Unlock()
+		return
+	}
+	select {
+	case <-b.closed:
+		b.mu.Unlock()
+		return
+	default:
+	}
+	b.emptyTimer = time.AfterFunc(b.emptyGrace, func() {
+		b.mu.Lock()
+		if len(b.paths) != 0 {
+			b.emptyTimer = nil
+			b.mu.Unlock()
+			return
+		}
+		b.emptyExpired = true
+		b.emptyTimer = nil
+		b.mu.Unlock()
+		_ = b.Close()
+	})
+	b.mu.Unlock()
 }
 
 func (b *BondedPacketConn) notifyStateChanged() {
@@ -590,17 +660,18 @@ func readBondControlLine(conn net.Conn, timeout time.Duration) (string, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return "", err
 	}
-	reader := bufio.NewReaderSize(io.LimitReader(conn, maxBondHelloSize+1), maxBondHelloSize+1)
-	line, err := reader.ReadString('\n')
+	record := make([]byte, maxBondHelloSize+1)
+	n, err := conn.Read(record)
 	if resetErr := conn.SetReadDeadline(time.Time{}); err == nil {
 		err = resetErr
 	}
-	if len(line) > maxBondHelloSize {
+	if n > maxBondHelloSize {
 		return "", fmt.Errorf("vless bond control record exceeds %d bytes", maxBondHelloSize)
 	}
 	if err != nil {
 		return "", err
 	}
+	line := string(record[:n])
 	if !strings.HasSuffix(line, "\n") {
 		return "", fmt.Errorf("unterminated vless bond control record")
 	}

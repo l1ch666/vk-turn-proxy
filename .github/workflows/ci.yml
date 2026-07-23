@@ -20,18 +20,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: 'stable'
-
-      - name: Cache Go modules
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/go-build
-            # Module cache
-            ${{ github.workspace }}/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+          go-version-file: go.mod
+          cache: true
 
       - name: Run gofmt (check)
         run: |
@@ -47,17 +37,29 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.12.2
           args: --timeout=5m ./...
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run tests
-        run: |
-          go test ./... -v
+      - name: Verify module files
+        run: go mod verify
+
+      - name: Run tests with race detector
+        run: go test -race ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Scan reachable vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Build every command
+        run: go build ./...
           
   build:
     name: Build binaries
+    needs: check
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -87,7 +89,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: 'stable'
+          go-version-file: go.mod
+          cache: true
 
       # Install Android NDK for android rows and expose ndk-path output
       - name: Setup Android NDK
@@ -138,16 +141,16 @@ jobs:
 
           GOOS=$GOOS GOARCH=$GOARCH \
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
-            -o "dist/client-${GOOS}-${GOARCH}${ext}" \
+            -o "dist/vk-turn-client-${GOOS}-${GOARCH}${ext}" \
             ./client
           
           GOOS=$GOOS GOARCH=$GOARCH \
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
-            -o "dist/server-${GOOS}-${GOARCH}${ext}" \
+            -o "dist/vk-turn-server-${GOOS}-${GOARCH}${ext}" \
             ./server
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: good-turn-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: vk-turn-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/**

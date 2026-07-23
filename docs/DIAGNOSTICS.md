@@ -48,7 +48,8 @@ Pprof is independently opt-in:
 
 ```sh
 # Append the normal server transport flags to this command.
-./server \
+./bin/vk-turn-server \
+  -client-auth-token-file=./client-auth-token \
   -diagnostics-listen=127.0.0.1:6060 \
   -diagnostics-token-file=./diagnostics.token \
   -diagnostics-pprof
@@ -88,8 +89,9 @@ the two fields are not symmetric wire-overhead measurements.
 FEC counters report received parity shards and recovered data packets.
 `fec_reported_errors` combines encoder failures with malformed recovered
 payloads; it does not include every Reed-Solomon reconstruction failure.
-`fec_short_shards` counts data-shard eviction caused by the bounded receive
-queue, but not timeout expiry. All KCP totals survive session rebuilds and reset
+`fec_full_shard_sets` is cumulative; `fec_incomplete_shard_sets` is a current
+gauge and is therefore present in snapshots but intentionally omitted from
+counter deltas. All cumulative KCP totals survive session rebuilds and reset
 only when the process restarts.
 
 Example requests:

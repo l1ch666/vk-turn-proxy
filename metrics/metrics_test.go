@@ -196,7 +196,8 @@ func TestSnapshotKCPExportsLibraryCounters(t *testing.T) {
 		FECRecovered:     21,
 		FECErrs:          22,
 		FECParityShards:  23,
-		FECShortShards:   24,
+		FECFullShardSet:  24,
+		FECShardSet:      25,
 	}
 
 	registry := Registry{kcpSNMP: source}
@@ -225,7 +226,8 @@ func TestSnapshotKCPExportsLibraryCounters(t *testing.T) {
 		FECRecoveredPackets:        21,
 		FECReportedErrors:          22,
 		FECParityShardsReceived:    23,
-		FECShortShards:             24,
+		FECFullShardSets:           24,
+		FECIncompleteShardSets:     25,
 	}
 	if got != want {
 		t.Fatalf("KCP snapshot = %+v, want %+v", got, want)

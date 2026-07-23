@@ -1,0 +1,20 @@
+vk-turn-proxy
+=============
+
+This repository is derived in part from:
+
+  cacggghp/vk-turn-proxy
+  https://github.com/cacggghp/vk-turn-proxy
+  imported source commit e8a96967dc66f3dbd631596ea6a8b9fe03f9be69
+
+The repository-level license is provided in LICENSE. Source files that carry
+their own copyright and SPDX notices remain subject to those notices. In
+particular, portions derived from the Pion community retain the MIT notice
+present in the relevant source files.
+
+This file is not a complete third-party binary-distribution license bundle.
+Official release candidates generate a reviewable baseline under
+THIRD_PARTY_LICENSES only after the audit in
+scripts/audit-third-party-licenses.sh passes. Public publishing remains blocked
+until that output receives human review and the issues in
+docs/RELEASE_LEGAL.md are closed.

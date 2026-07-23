@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -14,9 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/diagnostics"
-	"github.com/l1ch666/vk-turn-proxy/metrics"
-	"github.com/l1ch666/vk-turn-proxy/tcputil"
+	"github.com/l1ch666/vk-turn-proxy/v2/diagnostics"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/sessionauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/tcputil"
 	"github.com/pion/dtls/v3"
 	"github.com/xtaci/smux"
 )
@@ -35,6 +35,8 @@ func main() {
 	maxStreamsPerSession := flag.Int("max-streams-per-session", defaultMaxStreamsPerSession, "maximum active VLESS streams in one smux session")
 	dtlsCertificateFile := flag.String("dtls-cert-file", "", "PEM server certificate for a persistent DTLS identity (requires -dtls-key-file)")
 	dtlsKeyFile := flag.String("dtls-key-file", "", "PEM private key for the DTLS server certificate (requires -dtls-cert-file)")
+	clientAuthTokenFile := flag.String("client-auth-token-file", "", "private 64-hex-character token file used to authenticate clients (created with mode 0600 when missing)")
+	unsafeAllowUnauthenticatedClients := flag.Bool("unsafe-allow-unauthenticated-clients", false, "disable client authentication; exposes the configured backend to any DTLS client")
 	diagnosticOptions := diagnostics.RegisterFlags(flag.CommandLine)
 	tcputil.RegisterTuningFlags()
 	flag.Parse()
@@ -69,6 +71,23 @@ func main() {
 	log.Printf("DTLS server certificate SHA-256 fingerprint: %s", dtlsIdentity.fingerprint)
 	if dtlsIdentity.ephemeral {
 		log.Printf("WARNING: using an ephemeral DTLS identity; the fingerprint changes on restart (set -dtls-cert-file and -dtls-key-file for a persistent identity)")
+	}
+	var clientAuthToken *sessionauth.Token
+	if *unsafeAllowUnauthenticatedClients {
+		if *clientAuthTokenFile != "" {
+			log.Fatalf("-client-auth-token-file and -unsafe-allow-unauthenticated-clients cannot be used together")
+		}
+		log.Printf("WARNING: DTLS client authentication is disabled by explicit unsafe override")
+	} else {
+		token, created, tokenErr := sessionauth.LoadOrCreateTokenFile(*clientAuthTokenFile)
+		if tokenErr != nil {
+			log.Fatalf("invalid client authentication token: %s", tokenErr)
+		}
+		clientAuthToken = &token
+		if created {
+			log.Printf("created client authentication token file %s; copy it to clients over an authenticated channel", *clientAuthTokenFile)
+		}
+		log.Printf("DTLS client authentication: required")
 	}
 	log.Printf("vless mode: %s", enabledText(*vlessMode))
 	if *vlessMode {
@@ -195,6 +214,14 @@ func main() {
 				return
 			}
 			log.Println("Handshake done")
+			if clientAuthToken != nil {
+				if err := sessionauth.Verify(ctx1, dtlsConn, *clientAuthToken); err != nil {
+					metrics.Process.AuthFailed()
+					log.Printf("Client authentication failed from %s: %v", conn.RemoteAddr(), err)
+					return
+				}
+				log.Printf("Client authentication succeeded: %s", conn.RemoteAddr())
+			}
 
 			if *vlessMode {
 				if *vlessBond {
@@ -510,7 +537,9 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	ctx2, cancel2 := context.WithCancel(ctx)
-	context.AfterFunc(ctx2, func() {
+	deadlineDone := make(chan struct{})
+	stopDeadline := context.AfterFunc(ctx2, func() {
+		defer close(deadlineDone)
 		if err := conn.SetDeadline(time.Now()); err != nil {
 			log.Printf("failed to set incoming deadline: %s", err)
 		}
@@ -518,33 +547,33 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 			log.Printf("failed to set outgoing deadline: %s", err)
 		}
 	})
+	activity := newUDPActivity()
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		if activity.waitUntilIdle(ctx2, udpIdleTimeout) {
+			log.Printf("UDP session idle for %s; closing", udpIdleTimeout)
+			cancel2()
+		}
+	}()
 	go func() {
 		defer wg.Done()
 		defer cancel2()
-		buf := make([]byte, 1600)
+		buf := make([]byte, udpPacketBufferSize)
 		for {
-			select {
-			case <-ctx2.Done():
-				return
-			default:
-			}
-			if err1 := conn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
 			n, err1 := conn.Read(buf)
 			if err1 != nil {
-				log.Printf("Failed: %s", err1)
+				if ctx2.Err() == nil {
+					log.Printf("read DTLS packet: %s", err1)
+				}
 				return
 			}
-
-			if err1 = serverConn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
+			activity.touch()
 			_, err1 = serverConn.Write(buf[:n])
 			if err1 != nil {
-				log.Printf("Failed: %s", err1)
+				if ctx2.Err() == nil {
+					log.Printf("write backend UDP packet: %s", err1)
+				}
 				return
 			}
 		}
@@ -552,35 +581,32 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 	go func() {
 		defer wg.Done()
 		defer cancel2()
-		buf := make([]byte, 1600)
+		buf := make([]byte, udpPacketBufferSize)
 		for {
-			select {
-			case <-ctx2.Done():
-				return
-			default:
-			}
-			if err1 := serverConn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
 			n, err1 := serverConn.Read(buf)
 			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-
-			if err1 = conn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-				log.Printf("Failed: %s", err1)
+				if ctx2.Err() == nil {
+					log.Printf("read backend UDP packet: %s", err1)
+				}
 				return
 			}
 			_, err1 = conn.Write(buf[:n])
 			if err1 != nil {
-				log.Printf("Failed: %s", err1)
+				if ctx2.Err() == nil {
+					log.Printf("write DTLS packet: %s", err1)
+				}
 				return
 			}
 		}
 	}()
 	wg.Wait()
+	cancel2()
+	<-watchdogDone
+	if !stopDeadline() {
+		<-deadlineDone
+	}
+	_ = conn.SetDeadline(time.Time{})
+	_ = serverConn.SetDeadline(time.Time{})
 }
 
 // handleVLESSConnection creates a KCP+smux session over DTLS and forwards
@@ -705,46 +731,7 @@ func serveSmuxSession(ctx context.Context, smuxSess *smux.Session, connectAddr s
 
 // pipeConn copies data bidirectionally between two connections.
 func pipeConn(ctx context.Context, c1, c2 net.Conn) {
-	ctx2, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	deadlineDone := make(chan struct{})
-	stopDeadline := context.AfterFunc(ctx2, func() {
-		defer close(deadlineDone)
-		if err := c1.SetDeadline(time.Now()); err != nil {
-			log.Printf("pipeConn: failed to set deadline c1: %v", err)
-		}
-		if err := c2.SetDeadline(time.Now()); err != nil {
-			log.Printf("pipeConn: failed to set deadline c2: %v", err)
-		}
-	})
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		if _, err := io.Copy(c1, c2); err != nil {
-			log.Printf("pipeConn: c1<-c2 copy error: %v", err)
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		if _, err := io.Copy(c2, c1); err != nil {
-			log.Printf("pipeConn: c2<-c1 copy error: %v", err)
-		}
-	}()
-
-	wg.Wait()
-	cancel()
-	if !stopDeadline() {
-		<-deadlineDone
+	if err := tcputil.Pipe(ctx, c1, c2); err != nil && ctx.Err() == nil {
+		log.Printf("pipeConn: %v", err)
 	}
-
-	// Reset deadlines
-	_ = c1.SetDeadline(time.Time{})
-	_ = c2.SetDeadline(time.Time{})
 }

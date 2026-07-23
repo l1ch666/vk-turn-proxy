@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/l1ch666/vk-turn-proxy/dtlsauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/dtlsauth"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
 

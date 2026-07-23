@@ -3,7 +3,7 @@ package baseline
 import (
 	"fmt"
 
-	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
 )
 
 type MetricDelta struct {
@@ -46,7 +46,7 @@ type KCPCounterDelta struct {
 	FECRecoveredPackets        uint64 `json:"fec_recovered_packets"`
 	FECReportedErrors          uint64 `json:"fec_reported_errors"`
 	FECParityShardsReceived    uint64 `json:"fec_parity_shards_received"`
-	FECShortShards             uint64 `json:"fec_short_shards"`
+	FECFullShardSets           uint64 `json:"fec_full_shard_sets"`
 }
 
 func DiffMetrics(before, after metrics.Snapshot) (MetricDelta, error) {
@@ -104,7 +104,7 @@ func DiffMetrics(before, after metrics.Snapshot) (MetricDelta, error) {
 		{"kcp.fec_recovered_packets", before.KCP.FECRecoveredPackets, after.KCP.FECRecoveredPackets, &delta.KCP.FECRecoveredPackets},
 		{"kcp.fec_reported_errors", before.KCP.FECReportedErrors, after.KCP.FECReportedErrors, &delta.KCP.FECReportedErrors},
 		{"kcp.fec_parity_shards_received", before.KCP.FECParityShardsReceived, after.KCP.FECParityShardsReceived, &delta.KCP.FECParityShardsReceived},
-		{"kcp.fec_short_shards", before.KCP.FECShortShards, after.KCP.FECShortShards, &delta.KCP.FECShortShards},
+		{"kcp.fec_full_shard_sets", before.KCP.FECFullShardSets, after.KCP.FECFullShardSets, &delta.KCP.FECFullShardSets},
 	}
 	for _, counter := range uintCounters {
 		if counter.after < counter.before {

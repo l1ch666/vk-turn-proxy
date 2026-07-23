@@ -3,7 +3,7 @@ package baseline
 import (
 	"testing"
 
-	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
 )
 
 func TestDiffMetrics(t *testing.T) {
@@ -99,7 +99,7 @@ func TestDiffMetricsMapsAllKCPCounters(t *testing.T) {
 		FECRecoveredPackets:        19,
 		FECReportedErrors:          20,
 		FECParityShardsReceived:    21,
-		FECShortShards:             22,
+		FECFullShardSets:           22,
 	}}
 	got, err := DiffMetrics(metrics.Snapshot{}, after)
 	if err != nil {
@@ -127,7 +127,7 @@ func TestDiffMetricsMapsAllKCPCounters(t *testing.T) {
 		FECRecoveredPackets:        19,
 		FECReportedErrors:          20,
 		FECParityShardsReceived:    21,
-		FECShortShards:             22,
+		FECFullShardSets:           22,
 	}
 	if got.KCP != want {
 		t.Fatalf("KCP delta = %+v, want %+v", got.KCP, want)

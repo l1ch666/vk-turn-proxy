@@ -1,0 +1,16 @@
+.git
+.github
+.openai
+benchmarks/results
+bin
+dist
+*.exe
+*.out
+*.test
+*.pem
+*.key
+*.token
+client-auth-token
+diagnostics.token
+.env
+.env.*

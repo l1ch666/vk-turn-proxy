@@ -34,7 +34,8 @@ Start the server with both files:
   -listen 0.0.0.0:56000 \
   -connect 127.0.0.1:51820 \
   -dtls-cert-file ./dtls-server-cert.pem \
-  -dtls-key-file ./dtls-server-key.pem
+  -dtls-key-file ./dtls-server-key.pem \
+  -client-auth-token-file ./client-auth-token
 ```
 
 The server validates that both flags are present, loads the key pair before
@@ -52,6 +53,7 @@ untrusted path that the DTLS connection is meant to protect.
 ./bin/vk-turn-client \
   -peer SERVER_IP:56000 \
   -dtls-server-fingerprint '01:23:...:EF' \
+  -client-auth-token-file ./client-auth-token \
   ...
 ```
 
@@ -79,5 +81,6 @@ rotation.
 
 This mechanism authenticates the server to the client. It does not yet
 authenticate a client at the DTLS layer. Keep the global/per-IP connection
-limits enabled and protect conference invite links while PSK or mTLS client
-authentication remains a roadmap item.
+limits enabled and protect conference invite links. Client authentication is
+required separately through `-client-auth-token-file`; see
+[CLIENT_AUTH.md](CLIENT_AUTH.md).

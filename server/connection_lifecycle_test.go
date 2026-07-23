@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/metrics"
-	"github.com/l1ch666/vk-turn-proxy/tcputil"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/tcputil"
 	"github.com/xtaci/smux"
 )
 

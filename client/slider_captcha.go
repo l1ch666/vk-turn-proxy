@@ -10,7 +10,6 @@ import (
 	"image"
 	"image/color"
 	_ "image/jpeg"
-	"io"
 	"log"
 	mathrand "math/rand"
 	neturl "net/url"
@@ -132,7 +131,11 @@ func (s *captchaNotRobotSession) request(method string, values neturl.Values) (m
 		_ = httpResp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(httpResp.Body)
+	body, err := readResponseBodyLimited(
+		httpResp.Body,
+		maxCaptchaAPIResponseBytes,
+		"captcha API response",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -145,27 +148,23 @@ func (s *captchaNotRobotSession) request(method string, values neturl.Values) (m
 	return resp, nil
 }
 
-// successTokenRedactRe blanks the success_token before a response is logged so
-// diagnostics never leak a usable token.
-var successTokenRedactRe = regexp.MustCompile(`("success_token"\s*:\s*)"[^"]*"`)
-
-// dumpCaptchaResponse logs the raw VK reply (with success_token redacted) under
-// -debug. VK returns the real rejection reason (error_code/error_text/status)
-// here; the solver otherwise collapses everything into "status: ERROR".
+// dumpCaptchaResponse logs only non-secret status fields under -debug. Raw
+// replies may contain usable tokens, images, hashes, and URLs.
 func dumpCaptchaResponse(streamID int, method string, resp map[string]interface{}) {
 	if !isDebug {
 		return
 	}
-	data, err := json.Marshal(resp)
+	safe := make(map[string]interface{})
+	for _, key := range []string{"status", "error_code", "error_text", "show_captcha_type", "type"} {
+		if value, ok := resp[key]; ok {
+			safe[key] = value
+		}
+	}
+	data, err := json.Marshal(safe)
 	if err != nil {
 		return
 	}
-	dump := successTokenRedactRe.ReplaceAllString(string(data), `$1"***"`)
-	const maxLen = 2048
-	if len(dump) > maxLen {
-		dump = dump[:maxLen] + "...(truncated)"
-	}
-	log.Printf("[STREAM %d] [Captcha] %s raw response: %s", streamID, method, dump)
+	log.Printf("[STREAM %d] [Captcha] %s status response: %s", streamID, method, data)
 }
 
 // dumpCaptchaRequest logs the outgoing captcha request body (session_token
@@ -409,7 +408,7 @@ func buildCaptchaDeviceJSON(profile Profile) string {
 func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettingsResponse, error) {
 	respObj, ok := resp["response"].(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("invalid settings response: %v", resp)
+		return nil, responseShapeError("invalid settings response", resp)
 	}
 
 	settings := &captchaSettingsResponse{
@@ -590,7 +589,7 @@ func normalizeCaptchaSettings(raw interface{}) (string, error) {
 func parseCaptchaCheckResult(resp map[string]interface{}) (*captchaCheckResult, error) {
 	respObj, ok := resp["response"].(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("invalid check response: %v", resp)
+		return nil, responseShapeError("invalid check response", resp)
 	}
 
 	result := &captchaCheckResult{}
@@ -607,7 +606,7 @@ func parseCaptchaCheckResult(resp map[string]interface{}) (*captchaCheckResult, 
 func parseSliderCaptchaContentResponse(resp map[string]interface{}) (*sliderCaptchaContent, error) {
 	respObj, ok := resp["response"].(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("invalid slider content response: %v", resp)
+		return nil, responseShapeError("invalid slider content response", resp)
 	}
 
 	status, _ := respObj["status"].(string)

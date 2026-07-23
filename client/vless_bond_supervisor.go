@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/metrics"
-	"github.com/l1ch666/vk-turn-proxy/tcputil"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/tcputil"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )
@@ -20,6 +20,7 @@ import (
 const (
 	vlessBondStableGeneration = time.Minute
 	vlessBondV2FallbackGrace  = 8 * time.Second
+	vlessBondZeroPathGrace    = 10 * time.Second
 )
 
 var errVLESSBondV2Unavailable = errors.New("vless bond V2 unavailable")
@@ -123,6 +124,7 @@ type vlessBondGeneration struct {
 	failed      chan struct{}
 	failureMu   sync.Mutex
 	failureErr  error
+	zeroGrace   time.Duration
 }
 
 func newVLESSBondGeneration(id string, session bondSmuxSession, bonded *tcputil.BondedPacketConn, cleanup func()) *vlessBondGeneration {
@@ -133,6 +135,7 @@ func newVLESSBondGeneration(id string, session bondSmuxSession, bonded *tcputil.
 		startedAt: time.Now(),
 		cleanup:   cleanup,
 		failed:    make(chan struct{}),
+		zeroGrace: vlessBondZeroPathGrace,
 	}
 }
 
@@ -162,9 +165,31 @@ func (g *vlessBondGeneration) wait(ctx context.Context) error {
 	if g.bonded != nil {
 		stateChanged = g.bonded.StateChanged()
 	}
+	var zeroTimer *time.Timer
+	var zeroDeadline <-chan time.Time
+	stopZeroTimer := func() {
+		if zeroTimer == nil {
+			return
+		}
+		if !zeroTimer.Stop() {
+			select {
+			case <-zeroTimer.C:
+			default:
+			}
+		}
+		zeroTimer = nil
+		zeroDeadline = nil
+	}
+	defer stopZeroTimer()
+
 	for {
 		if g.bonded != nil && g.bonded.Count() == 0 {
-			return fmt.Errorf("vless bond generation %s has no active paths", shortBondID(g.id))
+			if zeroTimer == nil {
+				zeroTimer = time.NewTimer(g.zeroGrace)
+				zeroDeadline = zeroTimer.C
+			}
+		} else {
+			stopZeroTimer()
 		}
 		select {
 		case <-ctx.Done():
@@ -177,6 +202,16 @@ func (g *vlessBondGeneration) wait(ctx context.Context) error {
 			}
 			return fmt.Errorf("vless bond generation %s failed", shortBondID(g.id))
 		case <-stateChanged:
+		case <-zeroDeadline:
+			zeroTimer = nil
+			zeroDeadline = nil
+			if g.bonded != nil && g.bonded.Count() == 0 {
+				return fmt.Errorf(
+					"vless bond generation %s has no active paths for %s",
+					shortBondID(g.id),
+					g.zeroGrace,
+				)
+			}
 		}
 	}
 }

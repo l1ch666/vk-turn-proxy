@@ -59,7 +59,8 @@ type KCPSnapshot struct {
 	FECRecoveredPackets        uint64 `json:"fec_recovered_packets"`
 	FECReportedErrors          uint64 `json:"fec_reported_errors"`
 	FECParityShardsReceived    uint64 `json:"fec_parity_shards_received"`
-	FECShortShards             uint64 `json:"fec_short_shards"`
+	FECFullShardSets           uint64 `json:"fec_full_shard_sets"`
+	FECIncompleteShardSets     uint64 `json:"fec_incomplete_shard_sets"`
 }
 
 // Snapshot is a consistent-enough view of process transport metrics.
@@ -354,6 +355,7 @@ func snapshotKCP(source *kcp.Snmp) KCPSnapshot {
 		FECRecoveredPackets:        stats.FECRecovered,
 		FECReportedErrors:          stats.FECErrs,
 		FECParityShardsReceived:    stats.FECParityShards,
-		FECShortShards:             stats.FECShortShards,
+		FECFullShardSets:           stats.FECFullShardSet,
+		FECIncompleteShardSets:     stats.FECShardSet,
 	}
 }

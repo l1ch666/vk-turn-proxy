@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
 )
 
 const diagnosticsShutdownTimeout = 3 * time.Second

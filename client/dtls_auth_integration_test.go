@@ -8,12 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/dtlsauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/dtlsauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/sessionauth"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
 
-func testPinnedDTLSHandshake(t *testing.T, certificate tls.Certificate, authentication dtlsauth.ClientAuthentication) (error, error) {
+func testPinnedDTLSHandshake(t *testing.T, certificate tls.Certificate, authentication dtlsauth.ClientAuthentication, clientToken, serverToken *sessionauth.Token) (error, error) {
 	t.Helper()
 	listener, err := dtls.ListenWithOptions(
 		"udp",
@@ -43,7 +44,15 @@ func testPinnedDTLSHandshake(t *testing.T, certificate tls.Certificate, authenti
 			serverResult <- nil
 			return
 		}
-		serverResult <- dtlsConnection.HandshakeContext(ctx)
+		if handshakeErr := dtlsConnection.HandshakeContext(ctx); handshakeErr != nil {
+			serverResult <- handshakeErr
+			return
+		}
+		if serverToken != nil {
+			serverResult <- sessionauth.Verify(ctx, dtlsConnection, *serverToken)
+			return
+		}
+		serverResult <- nil
 	}()
 
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -55,7 +64,7 @@ func testPinnedDTLSHandshake(t *testing.T, certificate tls.Certificate, authenti
 		_ = packetConn.Close()
 		t.Fatalf("DTLS listener address has type %T", listener.Addr())
 	}
-	clientConnection, clientErr := dtlsFunc(ctx, packetConn, peer, authentication)
+	clientConnection, clientErr := dtlsFunc(ctx, packetConn, peer, authentication, clientToken)
 	if clientConnection != nil {
 		_ = clientConnection.Close()
 	} else {
@@ -78,7 +87,7 @@ func TestDTLSHandshakeAcceptsPinnedServerCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientErr, serverErr := testPinnedDTLSHandshake(t, certificate, authentication)
+	clientErr, serverErr := testPinnedDTLSHandshake(t, certificate, authentication, nil, nil)
 	if clientErr != nil || serverErr != nil {
 		t.Fatalf("pinned handshake failed: client=%v server=%v", clientErr, serverErr)
 	}
@@ -101,8 +110,28 @@ func TestDTLSHandshakeRejectsDifferentServerCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientErr, _ := testPinnedDTLSHandshake(t, certificate, authentication)
+	clientErr, _ := testPinnedDTLSHandshake(t, certificate, authentication, nil, nil)
 	if clientErr == nil || !strings.Contains(clientErr.Error(), "fingerprint mismatch") {
 		t.Fatalf("unexpected client error for mismatched pin: %v", clientErr)
+	}
+}
+
+func TestDTLSHandshakeAuthenticatesClientToken(t *testing.T) {
+	certificate, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := dtlsauth.CertificateFingerprint(certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authentication, err := dtlsauth.NewClientAuthentication(fingerprint.String(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := sessionauth.Token{1, 2, 3}
+	clientErr, serverErr := testPinnedDTLSHandshake(t, certificate, authentication, &token, &token)
+	if clientErr != nil || serverErr != nil {
+		t.Fatalf("mutually authenticated handshake failed: client=%v server=%v", clientErr, serverErr)
 	}
 }

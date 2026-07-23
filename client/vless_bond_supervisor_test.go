@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/tcputil"
+	"github.com/l1ch666/vk-turn-proxy/v2/tcputil"
 	"github.com/xtaci/smux"
 )
 
@@ -118,7 +118,7 @@ func TestSuperviseVLESSBondReplacesFailedGenerationAfterCleanup(t *testing.T) {
 	}
 }
 
-func TestVLESSBondGenerationFailsWhenLastPathDisappears(t *testing.T) {
+func TestVLESSBondGenerationFailsAfterZeroPathGrace(t *testing.T) {
 	bonded := tcputil.NewBondedPacketConn("test-generation-health")
 	defer func() { _ = bonded.Close() }()
 	left, right := net.Pipe()
@@ -131,6 +131,7 @@ func TestVLESSBondGenerationFailsWhenLastPathDisappears(t *testing.T) {
 
 	session := newFakeBondSmuxSession()
 	generation := newVLESSBondGeneration("0123456789abcdef", session, bonded, func() { _ = session.Close() })
+	generation.zeroGrace = 30 * time.Millisecond
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- generation.wait(context.Background()) }()
 	if err := right.Close(); err != nil {
@@ -143,11 +144,64 @@ func TestVLESSBondGenerationFailsWhenLastPathDisappears(t *testing.T) {
 	}
 	select {
 	case err := <-waitDone:
+		t.Fatalf("generation failed before zero-path grace elapsed: %v", err)
+	case <-time.After(generation.zeroGrace / 2):
+	}
+	select {
+	case err := <-waitDone:
 		if err == nil || !strings.Contains(err.Error(), "no active paths") {
 			t.Fatalf("generation wait error = %v, want no-active-paths error", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("generation did not fail after losing its last path")
+	}
+}
+
+func TestVLESSBondGenerationSurvivesPathRecoveryWithinGrace(t *testing.T) {
+	bonded := tcputil.NewBondedPacketConn("test-generation-recovery")
+	defer func() { _ = bonded.Close() }()
+	left, right := net.Pipe()
+	done := bonded.AddConn(left, nil)
+	select {
+	case <-bonded.StateChanged():
+	case <-time.After(time.Second):
+		t.Fatal("path add was not observed")
+	}
+
+	session := newFakeBondSmuxSession()
+	generation := newVLESSBondGeneration("0123456789abcdef", session, bonded, func() { _ = session.Close() })
+	generation.zeroGrace = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- generation.wait(ctx) }()
+
+	if err := right.Close(); err != nil {
+		t.Fatalf("close first path peer: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("first bond path did not stop")
+	}
+
+	replacement, replacementPeer := net.Pipe()
+	defer func() { _ = replacementPeer.Close() }()
+	bonded.AddConn(replacement, nil)
+	time.Sleep(2 * generation.zeroGrace)
+	select {
+	case err := <-waitDone:
+		t.Fatalf("generation failed after path recovered: %v", err)
+	default:
+	}
+
+	cancel()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("generation wait error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("generation did not stop after cancellation")
 	}
 }
 

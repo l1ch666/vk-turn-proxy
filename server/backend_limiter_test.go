@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
 )
 
 func TestNewBackendGateValidatesLimits(t *testing.T) {

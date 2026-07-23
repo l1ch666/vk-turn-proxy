@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/metrics"
+	"github.com/l1ch666/vk-turn-proxy/v2/metrics"
 )
 
 func TestBondedPacketConnWritesAcrossPaths(t *testing.T) {
@@ -108,6 +108,66 @@ func TestBondedPacketConnNotifiesPathStateChanges(t *testing.T) {
 	}
 	if pc.Count() != 0 {
 		t.Fatalf("path count after removal = %d, want 0", pc.Count())
+	}
+}
+
+func TestBondedPacketConnDropsDuringEmptyGraceThenCloses(t *testing.T) {
+	pc := newBondedPacketConn("test-empty-grace", 40*time.Millisecond)
+	payload := []byte("retransmit-me")
+
+	n, err := pc.WriteTo(payload, nil)
+	if err != nil {
+		t.Fatalf("WriteTo during empty-path grace: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("WriteTo during grace = %d bytes, want %d", n, len(payload))
+	}
+
+	select {
+	case <-pc.closed:
+	case <-time.After(time.Second):
+		t.Fatal("empty bond did not close after its bounded grace")
+	}
+	if _, err := pc.WriteTo(payload, nil); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("WriteTo after grace error = %v, want net.ErrClosed", err)
+	}
+}
+
+func TestBondedPacketConnRecoversDuringEmptyGrace(t *testing.T) {
+	pc := newBondedPacketConn("test-empty-recovery", 200*time.Millisecond)
+	defer func() { _ = pc.Close() }()
+	payload := []byte("packet")
+
+	if n, err := pc.WriteTo(payload, nil); err != nil || n != len(payload) {
+		t.Fatalf("initial grace write = (%d, %v), want (%d, nil)", n, err, len(payload))
+	}
+
+	left, right := net.Pipe()
+	defer func() { _ = right.Close() }()
+	pc.AddConn(left, nil)
+	received := make(chan string, 1)
+	go func() {
+		buf := make([]byte, len(payload))
+		n, _ := io.ReadFull(right, buf)
+		received <- string(buf[:n])
+	}()
+	if _, err := pc.WriteTo(payload, nil); err != nil {
+		t.Fatalf("WriteTo after path recovery: %v", err)
+	}
+	select {
+	case got := <-received:
+		if got != string(payload) {
+			t.Fatalf("recovered packet = %q, want %q", got, payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovered path did not receive packet")
+	}
+
+	time.Sleep(250 * time.Millisecond)
+	select {
+	case <-pc.closed:
+		t.Fatal("cancelled empty-path timer closed a recovered bond")
+	default:
 	}
 }
 
@@ -373,6 +433,22 @@ func TestReadBondHelloRejectsOversizedRecord(t *testing.T) {
 	}
 }
 
+func TestReadBondHelloDoesNotJoinSeparateDTLSRecords(t *testing.T) {
+	conn := &scriptedRecordConn{
+		records: [][]byte{
+			[]byte("VKTURNBOND/1 0123456789abcdef"),
+			[]byte("\n"),
+		},
+	}
+	if _, err := ReadBondHelloConfig(conn); err == nil ||
+		!strings.Contains(err.Error(), "unterminated") {
+		t.Fatalf("split hello error = %v, want unterminated record", err)
+	}
+	if conn.reads != 1 {
+		t.Fatalf("hello reader consumed %d DTLS records, want exactly 1", conn.reads)
+	}
+}
+
 func TestValidateBondHelloTuning(t *testing.T) {
 	hello := CurrentBondHello("0123456789abcdef", 4)
 	if err := ValidateBondHelloTuning(hello); err != nil {
@@ -402,6 +478,32 @@ func TestValidateBondHelloTuning(t *testing.T) {
 	if err := ValidateBondHelloTuning(mismatchedFEC); err == nil {
 		t.Fatal("mismatched FEC profile unexpectedly accepted")
 	}
+}
+
+type scriptedRecordConn struct {
+	records [][]byte
+	reads   int
+}
+
+func (conn *scriptedRecordConn) Read(p []byte) (int, error) {
+	if conn.reads >= len(conn.records) {
+		return 0, io.EOF
+	}
+	record := conn.records[conn.reads]
+	conn.reads++
+	return copy(p, record), nil
+}
+
+func (*scriptedRecordConn) Write(p []byte) (int, error) { return len(p), nil }
+func (*scriptedRecordConn) Close() error                { return nil }
+func (*scriptedRecordConn) LocalAddr() net.Addr         { return bondAddr("scripted/local") }
+func (*scriptedRecordConn) RemoteAddr() net.Addr        { return bondAddr("scripted/remote") }
+func (*scriptedRecordConn) SetDeadline(time.Time) error { return nil }
+func (*scriptedRecordConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (*scriptedRecordConn) SetWriteDeadline(time.Time) error {
+	return nil
 }
 
 func TestBondedPacketConnCarriesKCP(t *testing.T) {

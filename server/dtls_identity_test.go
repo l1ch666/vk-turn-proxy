@@ -8,9 +8,11 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/dtlsauth"
+	"github.com/l1ch666/vk-turn-proxy/v2/dtlsauth"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
@@ -76,6 +78,49 @@ func TestLoadServerDTLSIdentityLoadsPersistentPEM(t *testing.T) {
 	}
 	if identity.fingerprint != want {
 		t.Fatalf("loaded identity fingerprint = %s, want %s", identity.fingerprint, want)
+	}
+}
+
+func TestLoadServerDTLSIdentityCreatesPersistentBundleAtomically(t *testing.T) {
+	identityFile := filepath.Join(t.TempDir(), "dtls-server-identity.pem")
+	first, err := loadServerDTLSIdentity(identityFile, identityFile)
+	if err != nil {
+		t.Fatalf("create persistent identity: %v", err)
+	}
+	if first.ephemeral {
+		t.Fatal("created persistent identity was marked ephemeral")
+	}
+	if first.certificate.Leaf == nil || time.Until(first.certificate.Leaf.NotAfter) < 9*365*24*time.Hour {
+		t.Fatalf("persistent identity validity is too short: %+v", first.certificate.Leaf)
+	}
+	info, err := os.Stat(identityFile)
+	if err != nil {
+		t.Fatalf("stat persistent identity: %v", err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("persistent identity permissions = %04o, want 0600", info.Mode().Perm())
+	}
+
+	second, err := loadServerDTLSIdentity(identityFile, identityFile)
+	if err != nil {
+		t.Fatalf("reload persistent identity: %v", err)
+	}
+	if second.fingerprint != first.fingerprint {
+		t.Fatalf("reloaded fingerprint = %s, want %s", second.fingerprint, first.fingerprint)
+	}
+}
+
+func TestLoadServerDTLSIdentityRejectsSymlinkedPrivateKey(t *testing.T) {
+	identityFile := filepath.Join(t.TempDir(), "dtls-server-identity.pem")
+	if _, err := loadServerDTLSIdentity(identityFile, identityFile); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(filepath.Dir(identityFile), "linked-identity.pem")
+	if err := os.Symlink(identityFile, link); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	if _, err := loadServerDTLSIdentity(link, link); err == nil {
+		t.Fatal("symbolic-linked DTLS private key was accepted")
 	}
 }
 

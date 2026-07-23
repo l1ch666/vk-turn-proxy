@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/l1ch666/vk-turn-proxy/baseline"
-	"github.com/l1ch666/vk-turn-proxy/diagnostics"
+	"github.com/l1ch666/vk-turn-proxy/v2/baseline"
+	"github.com/l1ch666/vk-turn-proxy/v2/diagnostics"
 )
 
 type cliOptions struct {
@@ -98,14 +98,18 @@ func run(
 		return err
 	}
 
-	fmt.Fprintf(stdout, "Baseline complete: %s\n", options.RunConfig.OutputDirectory)
+	if _, err := fmt.Fprintf(stdout, "Baseline complete: %s\n", options.RunConfig.OutputDirectory); err != nil {
+		return fmt.Errorf("write baseline summary: %w", err)
+	}
 	for _, summary := range report.Summaries {
-		fmt.Fprintf(stdout, "  %s: median %.2f Mbit/s, retransmits %.1f (%d runs)\n",
+		if _, err := fmt.Fprintf(stdout, "  %s: median %.2f Mbit/s, retransmits %.1f (%d runs)\n",
 			summary.Case.Slug(),
 			summary.MedianBitsPerSecond/1_000_000,
 			summary.MedianRetransmittedSegments,
 			summary.Runs,
-		)
+		); err != nil {
+			return fmt.Errorf("write baseline case summary: %w", err)
+		}
 	}
 	return nil
 }

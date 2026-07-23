@@ -21,7 +21,7 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 - [x] Prevent stale TURN readers from consuming packets after reconnect.
 - [x] Close DTLS and packet-pipe resources after failed handshakes.
 - [x] Make bidirectional proxy, smux, KCP, and bond shutdown bounded.
-- [ ] Add versioned TCP half-close signaling (smux v1 cannot express CloseWrite/CloseRead).
+- [x] Preserve TCP half-close in both directions with a smux version that supports `CloseWrite`.
 
 ## Phase 2: bond correctness
 
@@ -29,6 +29,7 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 - [x] Negotiate protocol version, expected path count, MTU, and FEC configuration.
 - [x] Scale the server KCP window from the negotiated path count.
 - [x] Validate all KCP, FEC, MTU, and smux configuration at startup.
+- [x] Keep a bond generation alive through a bounded zero-path recovery grace period.
 
 ## Phase 3: observability and baseline
 
@@ -47,24 +48,31 @@ The goal is to improve correctness, resilience, throughput, and operational safe
 - [ ] Remove packet-hot-path allocations with pooled buffers and atomic path snapshots.
 - [ ] Evaluate UDP-first TURN connection racing with TCP fallback.
 - [ ] Evaluate adaptive FEC and path-MTU profiles.
-- [ ] Investigate a shared WireGuard backend socket per logical client session.
+- [ ] Add a negotiated, authenticated UDP-session ID so multipath shares one
+  WireGuard backend socket without mixing devices.
+  - [x] Fail safe to one non-VLESS UDP path until that protocol passes
+    multi-device, reconnect, race, and live-mobile tests.
 
 ## Phase 5: security, packaging, and releases
 
-- [ ] Authenticate the DTLS peer with a pinned server identity and client PSK or mTLS.
+- [x] Authenticate both sides of the DTLS transport before accepting proxy payloads.
   - [x] Require the client to pin the server leaf certificate's SHA-256 fingerprint in every transport mode.
   - [x] Support a persistent server certificate/key pair and fail closed on malformed identity configuration.
-  - [ ] Authenticate clients with a PSK or mTLS and define a safe credential-rotation procedure.
+  - [x] Require a 256-bit client bearer token inside the pinned DTLS channel and document safe file distribution/rotation.
 - [x] Add global/per-IP resource limits and bounded backend/smux concurrency.
   - [x] Bound active DTLS transports globally and per source IP, including the full lifetime of handed-off bond paths.
   - [x] Bound accepted smux streams and concurrent TCP backend dials/connections across sessions.
 - [x] Make unimplemented compatibility flags fail safely.
-- [ ] Run releases only from commits that passed required CI checks.
+- [x] Run tagged releases only after required race, vet, lint, build, and vulnerability checks.
 - [ ] Publish checksums, SBOM, provenance, and signed artifacts.
+  - [x] Publish checksums and request container SBOM/provenance attestations.
+  - [ ] Sign release archives and the checksum manifest.
 - [ ] Correct README/module/artifact provenance for this repository.
-  - [x] Use the canonical `github.com/l1ch666/vk-turn-proxy` module path and document the actual build targets and current security status.
-  - [ ] Verify repository-wide licensing and add release automation before declaring published artifact provenance complete.
+  - [x] Use the SemVer-compatible `github.com/l1ch666/vk-turn-proxy/v2` module path and document the actual build targets and current security status.
+  - [x] Verify repository-wide licensing, record upstream provenance, and gate tagged release automation.
 - [ ] Harden Docker and systemd execution with non-root users and resource limits.
+  - [x] Run the container as a fixed non-root user with a minimal build context and persistent private identity volume.
+  - [ ] Add a hardened systemd unit and packaging.
 
 ## Verification gates
 
