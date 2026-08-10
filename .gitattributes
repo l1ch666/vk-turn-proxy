@@ -7,3 +7,8 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 Dockerfile text eol=lf
+
+# The generated license bundle is byte-compared against a fresh run by the
+# license-image job. Without a pinned ending it would check out as CRLF on
+# Windows and never match a regenerated LF bundle.
+THIRD_PARTY_LICENSES/** text eol=lf
