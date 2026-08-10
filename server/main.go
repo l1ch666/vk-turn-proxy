@@ -274,10 +274,6 @@ type vlessBondManager struct {
 	runGroup    func(context.Context, *vlessBondGroup, func())
 }
 
-func newVLESSBondManager(connectAddr string) *vlessBondManager {
-	return newVLESSBondManagerWithGate(connectAddr, defaultBackendGate())
-}
-
 func newVLESSBondManagerWithGate(connectAddr string, gate *backendGate) *vlessBondManager {
 	return &vlessBondManager{
 		connectAddr: connectAddr,
@@ -287,10 +283,6 @@ func newVLESSBondManagerWithGate(connectAddr string, gate *backendGate) *vlessBo
 			group.run(ctx, onDone)
 		},
 	}
-}
-
-func (m *vlessBondManager) Add(ctx context.Context, conn net.Conn) error {
-	return m.add(ctx, conn, nil)
 }
 
 func (m *vlessBondManager) AddWithCleanup(ctx context.Context, conn net.Conn, cleanup func()) error {
@@ -391,10 +383,6 @@ type kcpWindowSetter interface {
 
 func (g *vlessBondGroup) matchesHello(hello tcputil.BondHello) bool {
 	return g.hello == hello
-}
-
-func (g *vlessBondGroup) add(conn net.Conn) error {
-	return g.addWithCleanup(conn, nil)
 }
 
 func (g *vlessBondGroup) addWithCleanup(conn net.Conn, cleanup func()) error {

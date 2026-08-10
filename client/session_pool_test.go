@@ -90,9 +90,18 @@ func newSmuxPair(t *testing.T) (client *smux.Session, server *smux.Session, clea
 	return client, server, cleanup
 }
 
+// leastLoaded returns the session openStream would try first.
+func leastLoaded(p *sessionPool) pooledSmuxSession {
+	candidates := p.candidates()
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[0]
+}
+
 func TestPickLeastLoadedEmptyPool(t *testing.T) {
 	p := &sessionPool{}
-	if got := p.pickLeastLoaded(); got != nil {
+	if got := leastLoaded(p); got != nil {
 		t.Fatalf("expected nil from empty pool, got %v", got)
 	}
 }
@@ -167,7 +176,7 @@ func TestPickLeastLoadedPrefersFewestStreams(t *testing.T) {
 
 	// Across several picks the idle session must always win (0 < busy load).
 	for i := 0; i < 8; i++ {
-		if got := p.pickLeastLoaded(); got != cIdle {
+		if got := leastLoaded(p); got != cIdle {
 			t.Fatalf("pick %d: expected idle session, got busy", i)
 		}
 	}
@@ -188,7 +197,7 @@ func TestPickLeastLoadedSkipsClosed(t *testing.T) {
 	p.add(cLive)
 
 	for i := 0; i < 5; i++ {
-		got := p.pickLeastLoaded()
+		got := leastLoaded(p)
 		if got != cLive {
 			t.Fatalf("pick %d: expected the live session, got the closed one", i)
 		}

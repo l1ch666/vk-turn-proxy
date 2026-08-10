@@ -1865,21 +1865,12 @@ func (p *sessionPool) remove(s pooledSmuxSession) {
 	p.mu.Unlock()
 }
 
-// pickLeastLoaded returns the live session currently carrying the fewest smux
-// streams, so a new TCP connection avoids a session whose TURN/DTLS path has
-// stalled (head-of-line) and isn't draining. With a single session it behaves
-// identically to round-robin selection; with N sessions it spreads load by
-// actual occupancy instead of a counter.
-// Round-robin (via the shared counter) breaks ties so equal-load sessions still
-// rotate. Closed sessions are skipped.
-func (p *sessionPool) pickLeastLoaded() pooledSmuxSession {
-	candidates := p.candidates()
-	if len(candidates) == 0 {
-		return nil
-	}
-	return candidates[0]
-}
-
+// candidates returns the live sessions ordered by current load, so a new TCP
+// connection avoids a session whose TURN/DTLS path has stalled (head-of-line)
+// and isn't draining. With a single session this behaves identically to
+// round-robin selection; with N sessions it spreads load by actual occupancy
+// instead of a counter. Round-robin (via the shared counter) breaks ties so
+// equal-load sessions still rotate. Closed sessions are skipped.
 func (p *sessionPool) candidates() []pooledSmuxSession {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

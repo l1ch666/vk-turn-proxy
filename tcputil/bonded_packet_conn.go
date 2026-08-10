@@ -457,10 +457,6 @@ func ioShortWrite(n, want int) error {
 	return fmt.Errorf("short write: wrote %d of %d bytes", n, want)
 }
 
-func WriteBondHello(conn net.Conn, bondID string) error {
-	return WriteBondHelloConfig(conn, BondHello{Version: BondProtocolV1, BondID: bondID})
-}
-
 // CurrentBondHello returns a V2 hello with the active wire-critical KCP profile.
 func CurrentBondHello(bondID string, expectedPaths int) BondHello {
 	dataShards, parityShards := FECShards()
@@ -514,19 +510,12 @@ func WriteBondHelloReject(conn net.Conn, code string) error {
 	return writeBondControlLine(conn, fmt.Sprintf("%s %s %s\n", bondHelloV2Token, bondHelloV2Error, code))
 }
 
-// ReadBondHello reads the bond hello line. It relies on DTLS datagram framing:
-// the peer sends the hello via a single WriteBondHello (its own DTLS record), so
-// the first read returns exactly the hello line and no subsequent KCP data is
-// consumed/lost. Do NOT coalesce the hello with other writes on the client side.
-func ReadBondHello(conn net.Conn) (string, error) {
-	hello, err := ReadBondHelloConfig(conn)
-	if err != nil {
-		return "", err
-	}
-	return hello.BondID, nil
-}
-
 // ReadBondHelloConfig accepts both the legacy V1 record and the V2 profile.
+//
+// It relies on DTLS datagram framing: the peer sends the hello as a single
+// standalone write (its own DTLS record), so the first read returns exactly the
+// hello line and no subsequent KCP data is consumed or lost. Do NOT coalesce the
+// hello with other writes on the client side.
 func ReadBondHelloConfig(conn net.Conn) (BondHello, error) {
 	line, err := readBondControlLine(conn, 10*time.Second)
 	if err != nil {

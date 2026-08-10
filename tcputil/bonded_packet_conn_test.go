@@ -293,6 +293,11 @@ func TestBondedPacketConnDoesNotCountWriteErrorDuringClose(t *testing.T) {
 	}
 }
 
+// writeBondHelloV1 sends the legacy V1 record through the production encoder.
+func writeBondHelloV1(conn net.Conn, bondID string) error {
+	return WriteBondHelloConfig(conn, BondHello{Version: BondProtocolV1, BondID: bondID})
+}
+
 func TestBondHelloRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -302,18 +307,21 @@ func TestBondHelloRoundTrip(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- WriteBondHello(left, "0123456789abcdef")
+		errCh <- writeBondHelloV1(left, "0123456789abcdef")
 	}()
 
-	got, err := ReadBondHello(right)
+	hello, err := ReadBondHelloConfig(right)
 	if err != nil {
-		t.Fatalf("ReadBondHello failed: %v", err)
+		t.Fatalf("ReadBondHelloConfig failed: %v", err)
 	}
 	if err := <-errCh; err != nil {
-		t.Fatalf("WriteBondHello failed: %v", err)
+		t.Fatalf("write V1 hello failed: %v", err)
 	}
-	if got != "0123456789abcdef" {
-		t.Fatalf("bond id = %q, want 0123456789abcdef", got)
+	if hello.Version != BondProtocolV1 {
+		t.Fatalf("hello version = %d, want %d", hello.Version, BondProtocolV1)
+	}
+	if hello.BondID != "0123456789abcdef" {
+		t.Fatalf("bond id = %q, want 0123456789abcdef", hello.BondID)
 	}
 }
 
@@ -324,7 +332,7 @@ func TestBondHelloV1WireFormatRemainsCompatible(t *testing.T) {
 
 	const want = "VKTURNBOND/1 0123456789abcdef\n"
 	writeDone := make(chan error, 1)
-	go func() { writeDone <- WriteBondHello(clientConn, "0123456789abcdef") }()
+	go func() { writeDone <- writeBondHelloV1(clientConn, "0123456789abcdef") }()
 	buf := make([]byte, len(want))
 	if _, err := io.ReadFull(serverConn, buf); err != nil {
 		t.Fatalf("read V1 wire record: %v", err)

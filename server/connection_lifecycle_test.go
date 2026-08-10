@@ -19,6 +19,15 @@ type recordingKCPWindow struct {
 	windows []int
 }
 
+// writeBondHelloV1 sends the legacy V1 record through the production encoder, so
+// these tests exercise the same path a real V1 client uses.
+func writeBondHelloV1(conn net.Conn, bondID string) error {
+	return tcputil.WriteBondHelloConfig(conn, tcputil.BondHello{
+		Version: tcputil.BondProtocolV1,
+		BondID:  bondID,
+	})
+}
+
 func newLifecycleTestBackendGate(t *testing.T) *backendGate {
 	t.Helper()
 	gate, err := newBackendGate(16, 8, &metrics.Registry{})
@@ -253,7 +262,7 @@ func TestVLESSBondGroupReturnsWhileWaitingForKCP(t *testing.T) {
 }
 
 func TestVLESSBondManagerWaitsForGroupShutdown(t *testing.T) {
-	manager := newVLESSBondManager("127.0.0.1:1")
+	manager := newVLESSBondManagerWithGate("127.0.0.1:1", defaultBackendGate())
 	serverConn, peerConn := net.Pipe()
 	t.Cleanup(func() {
 		_ = serverConn.Close()
@@ -262,10 +271,10 @@ func TestVLESSBondManagerWaitsForGroupShutdown(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- tcputil.WriteBondHello(peerConn, "0123456789abcdef")
+		writeDone <- writeBondHelloV1(peerConn, "0123456789abcdef")
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
-	if err := manager.Add(ctx, serverConn); err != nil {
+	if err := manager.AddWithCleanup(ctx, serverConn, nil); err != nil {
 		cancel()
 		t.Fatalf("failed to add bond path: %v", err)
 	}
@@ -294,7 +303,7 @@ func TestVLESSBondManagerWaitsForGroupShutdown(t *testing.T) {
 }
 
 func TestVLESSBondManagerRunsPathCleanupExactlyOnce(t *testing.T) {
-	manager := newVLESSBondManager("127.0.0.1:1")
+	manager := newVLESSBondManagerWithGate("127.0.0.1:1", defaultBackendGate())
 	serverConn, peerConn := net.Pipe()
 	t.Cleanup(func() {
 		_ = serverConn.Close()
@@ -303,7 +312,7 @@ func TestVLESSBondManagerRunsPathCleanupExactlyOnce(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- tcputil.WriteBondHello(peerConn, "0123456789abcdef")
+		writeDone <- writeBondHelloV1(peerConn, "0123456789abcdef")
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	var cleanupCalls atomic.Int32
@@ -325,7 +334,7 @@ func TestVLESSBondManagerRunsPathCleanupExactlyOnce(t *testing.T) {
 }
 
 func TestVLESSBondManagerAddsFirstPathBeforeStartingGroup(t *testing.T) {
-	manager := newVLESSBondManager("127.0.0.1:1")
+	manager := newVLESSBondManagerWithGate("127.0.0.1:1", defaultBackendGate())
 	startedWith := make(chan int, 1)
 	manager.runGroup = func(ctx context.Context, group *vlessBondGroup, onDone func()) {
 		startedWith <- group.pc.Count()
@@ -340,10 +349,10 @@ func TestVLESSBondManagerAddsFirstPathBeforeStartingGroup(t *testing.T) {
 		_ = peerConn.Close()
 	})
 	writeDone := make(chan error, 1)
-	go func() { writeDone <- tcputil.WriteBondHello(peerConn, "0123456789abcdef") }()
+	go func() { writeDone <- writeBondHelloV1(peerConn, "0123456789abcdef") }()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	if err := manager.Add(ctx, serverConn); err != nil {
+	if err := manager.AddWithCleanup(ctx, serverConn, nil); err != nil {
 		cancel()
 		t.Fatalf("failed to add bond path: %v", err)
 	}
@@ -384,10 +393,10 @@ func TestVLESSBondGroupGrowsKCPWindowForNewPaths(t *testing.T) {
 		_ = peer1.Close()
 		_ = peer2.Close()
 	})
-	if err := group.add(path1); err != nil {
+	if err := group.addWithCleanup(path1, nil); err != nil {
 		t.Fatalf("first path rejected: %v", err)
 	}
-	if err := group.add(path2); err != nil {
+	if err := group.addWithCleanup(path2, nil); err != nil {
 		t.Fatalf("second path rejected: %v", err)
 	}
 
@@ -434,16 +443,16 @@ func TestVLESSBondGroupRejectsExtraNegotiatedPath(t *testing.T) {
 		_ = peer2.Close()
 		_ = path2.Close()
 	})
-	if err := group.add(path1); err != nil {
+	if err := group.addWithCleanup(path1, nil); err != nil {
 		t.Fatalf("first path rejected: %v", err)
 	}
-	if err := group.add(path2); err == nil {
+	if err := group.addWithCleanup(path2, nil); err == nil {
 		t.Fatal("extra negotiated path unexpectedly accepted")
 	}
 }
 
 func TestVLESSBondManagerAcceptsV2AndAcknowledges(t *testing.T) {
-	manager := newVLESSBondManager("127.0.0.1:1")
+	manager := newVLESSBondManagerWithGate("127.0.0.1:1", defaultBackendGate())
 	serverConn, clientConn := net.Pipe()
 	t.Cleanup(func() {
 		_ = serverConn.Close()
@@ -461,7 +470,7 @@ func TestVLESSBondManagerAcceptsV2AndAcknowledges(t *testing.T) {
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	if err := manager.Add(ctx, serverConn); err != nil {
+	if err := manager.AddWithCleanup(ctx, serverConn, nil); err != nil {
 		cancel()
 		t.Fatalf("V2 path rejected: %v", err)
 	}
@@ -474,7 +483,7 @@ func TestVLESSBondManagerAcceptsV2AndAcknowledges(t *testing.T) {
 }
 
 func TestVLESSBondManagerRejectsMismatchedV2ProfileWithNACK(t *testing.T) {
-	manager := newVLESSBondManager("127.0.0.1:1")
+	manager := newVLESSBondManagerWithGate("127.0.0.1:1", defaultBackendGate())
 	serverConn, clientConn := net.Pipe()
 	t.Cleanup(func() {
 		_ = serverConn.Close()
@@ -496,7 +505,7 @@ func TestVLESSBondManagerRejectsMismatchedV2ProfileWithNACK(t *testing.T) {
 		clientDone <- tcputil.ReadBondHelloAck(clientConn)
 	}()
 
-	err := manager.Add(context.Background(), serverConn)
+	err := manager.AddWithCleanup(context.Background(), serverConn, nil)
 	if err == nil {
 		t.Fatal("mismatched V2 profile unexpectedly accepted")
 	}
