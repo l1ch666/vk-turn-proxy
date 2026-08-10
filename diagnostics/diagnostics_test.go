@@ -111,6 +111,12 @@ func TestServerMetricsAuthenticationAndContextShutdown(t *testing.T) {
 	assertStatus(t, client, http.MethodGet, baseURL+"/metrics", "", http.StatusUnauthorized)
 	assertStatus(t, client, http.MethodGet, baseURL+"/metrics?token="+testToken, "", http.StatusUnauthorized)
 	assertStatus(t, client, http.MethodGet, baseURL+"/metrics", "Bearer "+strings.Repeat("f", 64), http.StatusUnauthorized)
+	// An over-long but otherwise valid hex token must be rejected, not decoded
+	// into the fixed-size comparison buffer: hex.Decode writes one byte per pair
+	// without bounds-checking its destination.
+	assertStatus(t, client, http.MethodGet, baseURL+"/metrics", "Bearer "+strings.Repeat("f", 66), http.StatusUnauthorized)
+	assertStatus(t, client, http.MethodGet, baseURL+"/metrics", "Bearer "+strings.Repeat("a", 4096), http.StatusUnauthorized)
+	assertStatus(t, client, http.MethodGet, baseURL+"/metrics", "Bearer "+strings.Repeat("f", 63), http.StatusUnauthorized)
 	assertStatus(t, client, http.MethodGet, baseURL+"/healthz", "Bearer "+testToken, http.StatusOK)
 	assertStatus(t, client, http.MethodPost, baseURL+"/metrics", "Bearer "+testToken, http.StatusMethodNotAllowed)
 	assertStatus(t, client, http.MethodGet, baseURL+"/debug/pprof/", "Bearer "+testToken, http.StatusNotFound)

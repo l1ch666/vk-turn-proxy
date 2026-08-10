@@ -3,7 +3,6 @@ package diagnostics
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -226,9 +225,11 @@ func readOnlyJSON(snapshot func() any) http.HandlerFunc {
 func requireBearerToken(token [32]byte, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		scheme, rawToken, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
-		var supplied [32]byte
-		decoded, decodeErr := hex.Decode(supplied[:], []byte(strings.TrimSpace(rawToken)))
-		if !ok || !strings.EqualFold(scheme, "Bearer") || decodeErr != nil || decoded != len(supplied) ||
+		// decodeToken enforces the exact hex length before decoding. hex.Decode
+		// writes one byte per input pair without bounds-checking its destination,
+		// so decoding an attacker-sized header straight into a [32]byte panics.
+		supplied, decodeErr := decodeToken(strings.TrimSpace(rawToken))
+		if !ok || !strings.EqualFold(scheme, "Bearer") || decodeErr != nil ||
 			subtle.ConstantTimeCompare(token[:], supplied[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="vk-turn-proxy diagnostics"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
