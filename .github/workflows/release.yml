@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  quality:
+  verify:
     name: Verify release source
     runs-on: ubuntu-latest
     steps:
@@ -80,10 +80,52 @@ jobs:
       - name: Scan reachable vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
+  # Binary-distribution obligations attach to what an artifact links, so the
+  # image and the archives are audited separately. The image ships only
+  # ./server; the archives also ship ./client, whose graph is still blocked.
+  license-image:
+    name: Audit image licenses (./server)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Audit server-scoped third-party licenses
+        run: bash scripts/audit-third-party-licenses.sh regenerated-server ./server
+
+      - name: Verify the committed bundle is current
+        run: |
+          if ! diff -ru THIRD_PARTY_LICENSES/server regenerated-server; then
+            echo "THIRD_PARTY_LICENSES/server is stale; regenerate it with" >&2
+            echo "  bash scripts/audit-third-party-licenses.sh OUT ./server" >&2
+            exit 1
+          fi
+
+  license-archives:
+    name: Audit archive licenses (./...)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Audit third-party licenses
         id: license-audit
         continue-on-error: true
-        run: bash scripts/audit-third-party-licenses.sh legal-materials
+        run: bash scripts/audit-third-party-licenses.sh legal-materials ./...
 
       - name: Upload license audit materials
         if: ${{ always() }}
@@ -102,7 +144,7 @@ jobs:
 
   build:
     name: Package ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: quality
+    needs: license-archives
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -186,7 +228,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: legal-materials
-          path: THIRD_PARTY_LICENSES
+          path: THIRD_PARTY_LICENSES/all
 
       - name: Build and package
         shell: bash
@@ -285,7 +327,10 @@ jobs:
 
   docker:
     name: Publish Docker image
-    needs: publish
+    # Independent of the archive chain: the image ships only ./server, whose
+    # licenses pass their own fail-closed audit. It must not inherit a block
+    # caused by client-only dependencies it never links.
+    needs: license-image
     if: ${{ vars.RELEASE_LEGAL_APPROVED == 'true' }}
     runs-on: ubuntu-latest
     permissions:
@@ -295,12 +340,6 @@ jobs:
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v6
-
-      - name: Download audited legal materials
-        uses: actions/download-artifact@v7
-        with:
-          name: legal-materials
-          path: THIRD_PARTY_LICENSES
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4

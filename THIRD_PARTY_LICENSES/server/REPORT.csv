@@ -1,0 +1,15 @@
+package,license_url,license
+github.com/klauspost/cpuid/v2,https://github.com/klauspost/cpuid/blob/v2.4.0/LICENSE,MIT
+github.com/klauspost/reedsolomon,https://github.com/klauspost/reedsolomon/blob/v1.14.1/LICENSE,MIT
+github.com/l1ch666/vk-turn-proxy/v2,https://github.com/l1ch666/vk-turn-proxy/blob/HEAD/LICENSE,GPL-3.0
+github.com/pion/dtls/v3,https://github.com/pion/dtls/blob/v3.1.5/LICENSE,MIT
+github.com/pion/logging,https://github.com/pion/logging/blob/v0.2.4/LICENSE,MIT
+github.com/pion/transport/v4,https://github.com/pion/transport/blob/v4.0.2/LICENSE,MIT
+github.com/pkg/errors,https://github.com/pkg/errors/blob/v0.9.1/LICENSE,BSD-2-Clause
+github.com/tjfoc/gmsm/sm4,https://github.com/tjfoc/gmsm/blob/v1.4.1/LICENSE,Apache-2.0
+github.com/xtaci/kcp-go/v5,https://github.com/xtaci/kcp-go/blob/v5.6.72/LICENSE,MIT
+github.com/xtaci/smux,https://github.com/xtaci/smux/blob/v1.5.57/LICENSE,MIT
+golang.org/x/crypto,https://cs.opensource.google/go/x/crypto/+/v0.54.0:LICENSE,BSD-3-Clause
+golang.org/x/net,https://cs.opensource.google/go/x/net/+/v0.57.0:LICENSE,BSD-3-Clause
+golang.org/x/sys,https://cs.opensource.google/go/x/sys/+/v0.47.0:LICENSE,BSD-3-Clause
+golang.org/x/time/rate,https://cs.opensource.google/go/x/time/+/v0.15.0:LICENSE,BSD-3-Clause

@@ -148,10 +148,18 @@ or bind-mounted volume; otherwise replacing the container changes the
 fingerprint and pinned clients will correctly reject it. Custom
 `DTLS_CERT_FILE` and `DTLS_KEY_FILE` values must always be supplied together.
 
-Official v2 image publishing is currently blocked by the third-party license
-gate described in [docs/RELEASE_LEGAL.md](docs/RELEASE_LEGAL.md). Until that
-gate is resolved, build the image locally for testing and do not assume that an
-existing `latest` tag contains this v2 code.
+The image ships only `vk-turn-server`, whose entire linked dependency graph
+passes the third-party license audit, so building and running it is
+unrestricted:
+
+```sh
+docker build -t vk-turn-proxy:local .
+```
+
+Publishing to a registry additionally requires the human approval switch
+described in [docs/RELEASE_LEGAL.md](docs/RELEASE_LEGAL.md). Release *archives*
+remain blocked by client-only dependencies, so do not assume that an existing
+`latest` tag contains this v2 code.
 
 ```sh
 docker volume create vk-turn-state

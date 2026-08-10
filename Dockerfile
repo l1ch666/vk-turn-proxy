@@ -23,7 +23,9 @@ WORKDIR /app
 COPY --from=builder /out/vk-turn-server /app/vk-turn-server
 COPY --chown=vkturn:vkturn --chmod=0755 docker-entrypoint.sh /app/docker-entrypoint.sh
 COPY --chmod=0444 LICENSE NOTICE README.md docs/RELEASE_LEGAL.md /usr/share/licenses/vk-turn-proxy/
-COPY THIRD_PARTY_LICENSES /usr/share/licenses/vk-turn-proxy/THIRD_PARTY_LICENSES
+# Only the server-scoped bundle: this image ships exactly one binary, so it
+# carries the notices for the modules that binary actually links.
+COPY THIRD_PARTY_LICENSES/server /usr/share/licenses/vk-turn-proxy/THIRD_PARTY_LICENSES
 
 USER vkturn:vkturn
 VOLUME ["/var/lib/vk-turn"]
