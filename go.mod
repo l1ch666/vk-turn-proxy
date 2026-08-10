@@ -8,7 +8,6 @@ require (
 	github.com/bschaatsbergen/dnsdialer v0.0.0-20260519163822-5bc149399b81
 	github.com/cbeuw/connutil v1.0.1
 	github.com/google/uuid v1.6.0
-	github.com/gorilla/websocket v1.5.3
 	github.com/pion/dtls/v3 v3.1.5
 	github.com/pion/logging v0.2.4
 	github.com/pion/transport/v4 v4.0.2

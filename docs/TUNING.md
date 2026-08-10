@@ -75,7 +75,7 @@ What actually moves the needle, in order:
 > Quick start for a slow single stream: enable **KCP FEC** first; if your carrier
 > allows UDP, also try **`-udp`**; for single‑flow speed tests specifically, try
 > **`-vless-bond`** and compare. Change one at a time and measure.
-| `-n` | — | 10 (VK) / 1 (Yandex) | Parallel TURN streams. Main throughput multiplier. |
+| `-n` | — | 10 (VLESS) / 1 (UDP) | Parallel TURN streams. Main throughput multiplier. |
 | `-streams-per-cred` | — | 10 | Streams sharing one credential cache (fewer captcha/auth round‑trips). |
 
 On Android the core is launched by the app, so set env via the proxy service or

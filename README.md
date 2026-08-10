@@ -71,7 +71,7 @@ and `-dtls-key-file` as described in
 migration overrides are documented in
 [docs/CLIENT_AUTH.md](docs/CLIENT_AUTH.md).
 
-Start the client with exactly one supported conference invite link:
+Start the client with a VK conference invite link:
 
 ```sh
 ./bin/vk-turn-client \
@@ -83,8 +83,11 @@ Start the client with exactly one supported conference invite link:
   -n 1
 ```
 
-Use `-yandex-link` instead of `-vk-link` for a Yandex Telemost invite. Add
-`-udp` on the client to use TURN over UDP.
+Add `-udp` on the client to use TURN over UDP.
+
+Yandex Telemost is no longer supported: the provider closed the anonymous
+conference path this proxy relied on, so that code was removed rather than left
+in place as a broken option. The history before this change still contains it.
 
 Default UDP mode is intentionally shown with one path. Several independent
 UDP/DTLS paths currently create separate backend UDP associations and can make

@@ -9,7 +9,6 @@ const (
 	maxCaptchaBootstrapResponseBytes int64 = 8 << 20
 	maxCaptchaAPIResponseBytes       int64 = 2 << 20
 	maxVKAPIResponseBytes            int64 = 2 << 20
-	maxConferenceResponseBytes       int64 = 2 << 20
 )
 
 func readResponseBodyLimited(body io.Reader, maxBytes int64, description string) ([]byte, error) {
